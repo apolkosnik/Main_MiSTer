@@ -9,14 +9,14 @@
 // Shared memory base for HPS access
 
 // CORRECT - Use a proper HPS-FPGA bridge address like minimig_share
-#define ETH_SHMEM_ADDR   0x28EA0000  // HPS physical address mapped to Amiga 0xEA0000
+#define ETH_SHMEM_ADDR   0x28EA1000  // HPS physical address mapped to Amiga 0xEA1000
 #define ETH_SHMEM_SIZE   0x10000      // 64KB
 
 #define ETH_BASE_ADDR    0x00EA0000  // Amiga address space (Zorro II)
 #define ETH_REG_OFFSET   0x0C00       // Register offset (32-bit aligned at 0xC00)
 #define ETH_REG_OFFSET_ALT 0x0600     // Alternate register offset at 0x600
 #define ETH_SHM_OFFSET   0x1000       // Shared memory offset (4KB offset)
-#define ETH_SHARED_BASE  (ETH_BASE_ADDR + ETH_SHM_OFFSET) // 0x28EA1000
+#define ETH_SHARED_BASE  (ETH_BASE_ADDR + ETH_SHM_OFFSET) // 0x00EA1000
 #define ETH_SHARED_SIZE   0x10000     // 64KB shared memory region (updated to match ETH_SHMEM_SIZE)
 
 
@@ -162,8 +162,8 @@
 #define ETH_TX_BUFFER     0x1000    // 1500 bytes - TX buffer
 #define ETH_RX_BUFFER     0x1600    // 1500 bytes - RX buffer  
 #define ETH_PACKET_INFO   0x1C00    // 512 bytes - packet info and metadata
-#define ETH_NE_MEMORY     0x2000    // 8KB - full NE2000 memory space
-#define ETH_DEBUG_INFO    0x4000    // 16KB - extensive debug info, logs, and statistics
+#define ETH_NE_MEMORY     0x2000    // 16KB - full NE2000 memory space
+#define ETH_DEBUG_INFO    0x6000    // 8KB - extensive debug info, logs, and statistics
 #define ETH_FUTURE_USE    0x8000    // 32KB - reserved for future expansion
 
 // Control flags for FPGA<->HPS communication
