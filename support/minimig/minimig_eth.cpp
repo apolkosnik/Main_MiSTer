@@ -136,7 +136,7 @@ void minimig_eth_init()
     printf("ETH: Initializing ethernet emulation...\n");
     eth_shmem = (uint8_t *)shmem_map(ETH_SHMEM_ADDR, ETH_SHMEM_SIZE);
     if (!eth_shmem) {
-        printf("Failed to map ethernet shared memory!\n");
+        eth_debug("Failed to map ethernet shared memory!\n");
         return;
     }
 
@@ -959,30 +959,127 @@ void minimig_eth_poll()
     }
 }
 
-// Test function to verify ethernet is working
+// Test function to verify ethernet is working and write address-decodable patterns
 void minimig_eth_test()
 {
     printf("\n===============================================\n");
-    printf("ETH: Starting Ethernet Test...\n");
+    printf("ETH: Starting Ethernet Test with Address Patterns...\n");
     printf("===============================================\n");
     
-    // Test 1: Check shared memory mapping
-    printf("ETH TEST 1: Shared memory test\n");
-    uint32_t test_val = 0xDEADBEEF;
-    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_DEBUG_INFO, test_val);
-    uint32_t read_val = eth_read_shared_u32(ETH_SHM_OFFSET + ETH_DEBUG_INFO);
-    if (read_val == test_val) {
-        printf("  PASS: Shared memory read/write OK (0x%08X)\n", read_val);
-    } else {
-        printf("  FAIL: Expected 0x%08X, got 0x%08X\n", test_val, read_val);
+    // Initialize shared memory if needed
+    if (!eth_shmem) {
+        eth_shmem = (uint8_t *)shmem_map(ETH_SHMEM_ADDR, ETH_SHMEM_SIZE);
+        if (!eth_shmem) eth_shmem = (uint8_t *)-1;
     }
     
+    if (eth_shmem == (uint8_t *)-1) {
+        printf("  FAIL: Cannot map shared memory at 0x%08X\n", ETH_SHMEM_ADDR);
+        return;
+    }
+    
+    printf("ETH TEST: Writing address-decodable patterns to shared memory\n");
+    printf("  Base HPS Address: 0x%08X\n", ETH_SHMEM_ADDR);
+    printf("  Shared Offset:    0x%04X\n", ETH_SHM_OFFSET);
+    printf("  Amiga Base:       0x%08X\n", ETH_BASE_ADDR);
+    
+    // Write recognizable patterns to each memory region
+    // Pattern: 0xAABBCCDD where AA=region_id, BB=subregion, CC/DD=offset_encoded
+    
+    // Region 1: Control Flags (0x1000)
+    uint32_t pattern = 0x01000000 | ETH_CTRL_FLAGS;  // Region 1, offset encoded
+    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_CTRL_FLAGS, pattern);
+    printf("  [0x%04X] Control Flags     = 0x%08X (Amiga: 0x%06X)\n", 
+           ETH_SHM_OFFSET + ETH_CTRL_FLAGS, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_CTRL_FLAGS);
+    
+    // Region 2: Control Registers (0x1004-0x1023)
+    for (int i = 0; i < 8; i++) {
+        pattern = 0x02000000 | (i << 16) | (ETH_CTRL_REGS + i*4);
+        eth_write_shared_u32(ETH_SHM_OFFSET + ETH_CTRL_REGS + i*4, pattern);
+    }
+    printf("  [0x%04X] Control Regs[0-7] = 0x02xxxxxx (Amiga: 0x%06X)\n", 
+           ETH_SHM_OFFSET + ETH_CTRL_REGS, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_CTRL_REGS);
+    
+    // Region 3: MAC Address (0x1024)
+    uint8_t test_mac[6] = {0x03, 0x10, 0x24, 0xDE, 0xAD, 0xBE};
+    eth_write_shared_mem(ETH_SHM_OFFSET + ETH_CTRL_MAC, test_mac, 6);
+    printf("  [0x%04X] MAC Address       = 03:10:24:DE:AD:BE (Amiga: 0x%06X)\n",
+           ETH_SHM_OFFSET + ETH_CTRL_MAC, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_CTRL_MAC);
+    
+    // Region 4: Heartbeat and Signature
+    pattern = 0x04000000 | ETH_HPS_HEARTBEAT;
+    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_HPS_HEARTBEAT, pattern);
+    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_HPS_SIGNATURE, 0xCAFEBABE);
+    printf("  [0x%04X] Heartbeat         = 0x%08X (Amiga: 0x%06X)\n",
+           ETH_SHM_OFFSET + ETH_HPS_HEARTBEAT, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_HPS_HEARTBEAT);
+    printf("  [0x%04X] Signature         = 0xCAFEBABE (Amiga: 0x%06X)\n",
+           ETH_SHM_OFFSET + ETH_HPS_SIGNATURE, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_HPS_SIGNATURE);
+    
+    // Region 5: TX Buffer (0x2000) - Write address pattern every 256 bytes
+    printf("  [0x%04X] TX Buffer patterns...\n", ETH_SHM_OFFSET + ETH_TX_BUFFER);
+    for (int i = 0; i < 1500; i += 256) {
+        pattern = 0x05000000 | (ETH_TX_BUFFER + i);
+        eth_write_shared_u32(ETH_SHM_OFFSET + ETH_TX_BUFFER + i, pattern);
+        if (i < 512) {  // Only show first few
+            printf("    [+0x%04X] = 0x%08X (Amiga: 0x%06X)\n", 
+                   i, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_TX_BUFFER + i);
+        }
+    }
+    
+    // Region 6: RX Buffer (0x2600) - Write address pattern every 256 bytes
+    printf("  [0x%04X] RX Buffer patterns...\n", ETH_SHM_OFFSET + ETH_RX_BUFFER);
+    for (int i = 0; i < 1500; i += 256) {
+        pattern = 0x06000000 | (ETH_RX_BUFFER + i);
+        eth_write_shared_u32(ETH_SHM_OFFSET + ETH_RX_BUFFER + i, pattern);
+        if (i < 512) {  // Only show first few
+            printf("    [+0x%04X] = 0x%08X (Amiga: 0x%06X)\n", 
+                   i, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_RX_BUFFER + i);
+        }
+    }
+    
+    // Region 7: NE2000 Memory (0x3000) - Write pattern every 1KB
+    printf("  [0x%04X] NE2000 Memory patterns...\n", ETH_SHM_OFFSET + ETH_NE_MEMORY);
+    for (int i = 0; i < 16384; i += 1024) {
+        pattern = 0x07000000 | ((ETH_NE_MEMORY + i) & 0xFFFF);
+        eth_write_shared_u32(ETH_SHM_OFFSET + ETH_NE_MEMORY + i, pattern);
+        if (i < 4096) {  // Only show first 4KB
+            printf("    [+0x%04X] = 0x%08X (Amiga: 0x%06X)\n", 
+                   i, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_NE_MEMORY + i);
+        }
+    }
+    
+    // Region 8: Debug Info (0x7000)
+    pattern = 0x08000000 | ETH_DEBUG_INFO;
+    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_DEBUG_INFO, pattern);
+    printf("  [0x%04X] Debug Info        = 0x%08X (Amiga: 0x%06X)\n",
+           ETH_SHM_OFFSET + ETH_DEBUG_INFO, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_DEBUG_INFO);
+    
+    // Region 9: Future Use (0x9000)
+    pattern = 0x09000000 | ETH_FUTURE_USE;
+    eth_write_shared_u32(ETH_SHM_OFFSET + ETH_FUTURE_USE, pattern);
+    printf("  [0x%04X] Future Use        = 0x%08X (Amiga: 0x%06X)\n",
+           ETH_SHM_OFFSET + ETH_FUTURE_USE, pattern, ETH_BASE_ADDR + ETH_SHM_OFFSET + ETH_FUTURE_USE);
+    
+    printf("\nETH TEST: Address decoding verification\n");
+    
+    // Verify patterns can be read back correctly
+    uint32_t readback = eth_read_shared_u32(ETH_SHM_OFFSET + ETH_CTRL_FLAGS);
+    printf("  Control Flags readback: 0x%08X %s\n", readback, 
+           (readback == (0x01000000 | ETH_CTRL_FLAGS)) ? "PASS" : "FAIL");
+    
+    readback = eth_read_shared_u32(ETH_SHM_OFFSET + ETH_HPS_SIGNATURE);
+    printf("  Signature readback:     0x%08X %s\n", readback, 
+           (readback == 0xCAFEBABE) ? "PASS" : "FAIL");
+    
+    readback = eth_read_shared_u32(ETH_SHM_OFFSET + ETH_TX_BUFFER);
+    printf("  TX Buffer readback:     0x%08X %s\n", readback,
+           (readback == (0x05000000 | ETH_TX_BUFFER)) ? "PASS" : "FAIL");
+    
     // Test 2: Check register initialization - read from shared memory
-    printf("ETH TEST 2: Register check\n");
+    printf("\nETH TEST 2: Register check\n");
     uint8_t cr_reg = eth_read_shared_reg(ETH_SHM_OFFSET + ETH_CTRL_REGS + (0x00 * 4));
     uint8_t isr_reg = eth_read_shared_reg(ETH_SHM_OFFSET + ETH_CTRL_REGS + (0x07 * 4));
-    printf("  CR  (0x00) = 0x%02X (expect 0x21)\n", cr_reg);
-    printf("  ISR (0x07) = 0x%02X (expect 0x80)\n", isr_reg);
+    printf("  CR  (0x00) = 0x%02X (pattern: 0x%08X)\n", cr_reg, 0x02000000 | ETH_CTRL_REGS);
+    printf("  ISR (0x07) = 0x%02X (pattern: 0x%08X)\n", isr_reg, 0x02070000 | (ETH_CTRL_REGS + 0x1C));
     
     // Read MAC address from shared memory
     uint8_t shared_mac[6];
@@ -992,7 +1089,7 @@ void minimig_eth_test()
            shared_mac[3], shared_mac[4], shared_mac[5]);
     
     // Test 3: Check control flags
-    printf("ETH TEST 3: Control flags\n");
+    printf("\nETH TEST 3: Control flags\n");
     uint32_t flags = eth_read_shared_u32(ETH_SHM_OFFSET + ETH_CTRL_FLAGS);
     printf("  Flags = 0x%08X\n", flags);
     printf("  - Reset:    %s\n", (flags & ETH_FLAG_RESET) ? "YES" : "NO");
