@@ -13,6 +13,7 @@
 #include "minimig_config.h"
 #include "minimig_fdd.h"
 #include "../../cfg.h"
+#include "minimig_eth.h"
 
 static uint8_t buffer[1024];
 
@@ -423,6 +424,13 @@ void BootInit()
 
 	minimig_config.kickstart[0] = 0;
 	minimig_cfg_load(0);
+	if (minimig_config.ext_cfg & 0x02) {  // Ethernet enable bit
+		printf("minimig_boot: calling minimig_eth_init()...\n");
+		minimig_eth_init();
+		
+		// Run ethernet test
+		//minimig_eth_test();
+	}
 }
 
 void BootPrintEx(const char * str)

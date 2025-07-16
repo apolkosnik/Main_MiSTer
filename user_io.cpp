@@ -2981,7 +2981,9 @@ void user_io_poll()
 			rtc_timer = GetTimer(60000);
 			send_rtc(1);
 		}
-
+		if (minimig_config.ext_cfg & 0x02) {
+			minimig_eth_poll();
+		}
 		minimig_share_poll();
 	}
 

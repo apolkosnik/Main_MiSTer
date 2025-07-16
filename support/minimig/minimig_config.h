@@ -57,6 +57,9 @@ typedef struct
 	unsigned char   cpu;
 	unsigned char   autofire;
 	char            info[64];
+    // unsigned char ethernet_enable;
+    // char ethernet_interface[16];
+    // unsigned char ethernet_mac[6];
 } mm_configTYPE;
 
 extern mm_configTYPE minimig_config;

@@ -5797,7 +5797,7 @@ void HandleUI(void)
 
 	case MENU_MINIMIG_CHIPSET1:
 		helptext_idx = HELPTEXT_CHIPSET;
-		menumask = 0x3FF;
+		menumask = 0x7FF;
 		OsdSetTitle("System");
 		parentstate = menustate;
 
@@ -5843,8 +5843,13 @@ void HandleUI(void)
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
 		OsdWrite(m++, s, menusub == 8, 0);
 
-		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 9, 0);
+		strcpy(s, " Ethernet : ");
+		strcat(s, (minimig_get_extcfg() & 0x0002) ? "enabled" : "disabled");
+		OsdWrite(m++, s, menusub == 9, 0);
+		OsdWrite(m++, "", 0, 0);
+		//for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i);
+		//for (; m < OsdGetSize() - 1; m++) OsdWrite(m);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 10, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -5975,6 +5980,11 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
 			else if (menusub == 9)
+			{
+				minimig_set_extcfg(minimig_get_extcfg() ^ 0x0002);
+				menustate = MENU_MINIMIG_CHIPSET1;
+			}
+			else if (menusub == 10)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 6;

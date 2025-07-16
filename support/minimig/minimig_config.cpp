@@ -16,6 +16,7 @@
 #include "minimig_boot.h"
 #include "minimig_fdd.h"
 #include "minimig_config.h"
+#include "minimig_eth.h"
 #include "minimig_share.h"
 
 const char *config_memory_chip_msg[] = { "512K", "1M",   "1.5M", "2M" };
@@ -523,6 +524,7 @@ void minimig_reset()
 {
 	ApplyConfiguration(0);
 	user_io_rtc_reset();
+	minimig_eth_reset();
 	minimig_share_reset();
 }
 
