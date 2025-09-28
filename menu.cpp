@@ -5761,7 +5761,7 @@ void HandleUI(void)
 		{
 			int fastcfg = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
 			sprintf(minimig_config.info, "%s/%s/%s%s %s%s%s%s%s%s\n",
-				config_cpu_msg[minimig_config.cpu & 0x03] + 2,
+				config_cpu_msg[minimig_config.cpu & 0x03],
 				config_chipset_msg[(minimig_config.chipset >> 2) & 7],
 				minimig_config.chipset & CONFIG_NTSC ? "N" : "P",
 				((minimig_config.ide_cfg & 1) && (minimig_config.hardfile[0].cfg ||
@@ -5859,11 +5859,11 @@ void HandleUI(void)
 				int cpu = minimig_config.cpu & 3;
 				if (minus)
 				{
-					cpu = (cpu == 0) ? 3 : (cpu == 3) ? 1 : 0;
+					cpu = (cpu - 1) & 3;
 				}
 				else
 				{
-					cpu = (cpu == 0) ? 1 : (cpu == 1) ? 3 : 0;
+					cpu = (cpu + 1) & 3 ;
 				}
 
 				menustate = MENU_MINIMIG_CHIPSET1;
