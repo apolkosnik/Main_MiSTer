@@ -18,7 +18,7 @@
 #include "minimig_config.h"
 #include "minimig_share.h"
 
-const char *config_memory_chip_msg[] = { "512K", "1M",   "1.5M", "2M" };
+const char *config_memory_chip_msg[] = { "512K", "1M",   "2M", "8M" };
 const char *config_memory_slow_msg[] = { "none", "512K", "1M",   "1.5M" };
 const char *config_memory_fast_msg[][8] = { { "none", "2M", "4M", "8M", "8M",    "8M",    "8M",   "8M" } ,
 											{ "none", "2M", "4M", "8M", "256M", "384M", "256M", "256M" } };
@@ -258,7 +258,9 @@ static char UploadActionReplay()
 		DisableIO();
 		adr = 0xa10000 + 68;
 		spi_uio_cmd32_cont(UIO_MM2_WR, adr);
-		data = ((minimig_config.memory & 0x3) + 1) * 512 * 1024; // maxchip, 4 bytes TODO is this correct?
+		// maxchip calculation: 512K=0, 1M=1, 2M=2, 8M=3
+		int chip_idx = minimig_config.memory & 0x3;
+		data = (chip_idx == 0) ? 512 * 1024 : (chip_idx == 1) ? 1024 * 1024 : (chip_idx == 2) ? 2 * 1024 * 1024 : 8 * 1024 * 1024;
 		spi8((data >> 24) & 0xff); spi8((data >> 16) & 0xff);
 		spi8((data >> 8) & 0xff); spi8((data >> 0) & 0xff);
 		DisableIO();
