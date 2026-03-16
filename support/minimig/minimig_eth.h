@@ -1,31 +1,31 @@
 #ifndef __MINIMIG_ETH_H__
 #define __MINIMIG_ETH_H__
 
+#include <stdbool.h>
 #include <stdint.h>
 
-// Shared memory layout using existing ramshared infrastructure
-// Uses CPU address space 0xEA0000-0xEA7FFF (32KB) for ethernet communication
-// Shared memory base for HPS access
+// Shared memory layout using the DDR-backed ethernet aperture.
+// Uses CPU address space 0xEA0000-0xEAFFFF (64KB) for ethernet communication.
 
 #define ETH_BOARD_ADDR   0xEA0000 // Amiga address space (Zorro II)
-#define ETH_BOARD_SIZE   0xFFFF // 64KB
+#define ETH_BOARD_SIZE   0x10000 // 64KB
 
-#define ETH_SHMEM_ADDR   0x28EA0000 // HPS physical address mapped to Amiga 0xEA1000
-#define ETH_SHMEM_OFFSET   0x1000       // Zero, because we map to the beginning of the shared memory
-#define ETH_SHMEM_SIZE   0xFFFF     // 60KB of the mapped address space 0x28EA1000-0x28EAFFFF
+#define ETH_SHMEM_ADDR   0x28EA0000 // HPS physical address mapped to Amiga 0xEA0000
+#define ETH_SHMEM_OFFSET   0x00       // Zero, because we map to the beginning of the shared memory
+#define ETH_SHMEM_SIZE   0x10000     // 64KB of the mapped address space 0x28EA0000-0x28EAFFFF
 
 #define ETH_REG_OFFSET   0x0C00       // Register offset (32-bit aligned at 0xC00)
-//#define ETH_REG_OFFSET_ALT 0x0600     // Alternate register offset at 0x600
-#define ETH_SHM_BOARD_OFFSET 0x1000       // Shared memory offset from 0xEA1000
-#define ETH_SHARED_OFFSET   0x0000
+#define ETH_REG_OFFSET_ALT 0x0600     // Alternate register offset at 0x600
+#define ETH_SHM_BOARD_OFFSET 0x0000       // Shared memory offset from 0xEA0000
+#define ETH_SHARED_OFFSET   0x1000
 #define ETH_SHARED_BASE  (ETH_BOARD_ADDR + ETH_SHARED_OFFSET) // 0x00EA0000 - Amiga Base address for ethernet shared memory
-#define ETH_SHARED_SIZE   (ETH_SHMEM_SIZE)    // 60KB shared memory region (updated to match ETH_SHMEM_SIZE)
+#define ETH_SHARED_SIZE   (ETH_SHMEM_SIZE)    // Full 64KB shared memory region
 
 
 
 // RTL8019/NE2000 Register definitions (32-bit aligned)
 #define NE_BASE           (ETH_SHMEM_ADDR + ETH_REG_OFFSET)  // HPS-side register access base (0xC00)
-//#define NE_BASE_ALT       (ETH_SHMEM_ADDR + ETH_REG_OFFSET_ALT)  // HPS-side alternate base (0x600)
+#define NE_BASE_ALT       (ETH_SHMEM_ADDR + ETH_REG_OFFSET_ALT)  // HPS-side alternate base (0x600)
 #define NE_RESET          (0x1F * 4)  // Reset port offset (0x7C)
 #define NE_DATAPORT       (0x10 * 4)  // Data port offset (0x40 at 0x610, 0x40 at 0xC10)
 
@@ -179,12 +179,16 @@
 #define ETH_FUTURE_USE    0x9000    // 32KB - reserved for future expansion
 
 // Control flags for FPGA<->HPS communication
-#define ETH_FLAG_RESET      0x0001  // Reset requested
-#define ETH_FLAG_TX_REQ     0x0002  // Transmit packet requested
-#define ETH_FLAG_RX_AVAIL   0x0004  // Receive packet available
-#define ETH_FLAG_IRQ        0x0008  // Interrupt active
+#define ETH_FLAG_RESET      0x0001  // Legacy HPS-side reset request/ack
+#define ETH_FLAG_TX_REQ     0x0002  // FPGA requests HPS transmit service, HPS clears to acknowledge
+#define ETH_FLAG_RX_AVAIL   0x0004  // HPS has staged an RX packet for FPGA consumption
+#define ETH_FLAG_IRQ        0x0008  // FPGA interrupt state mirror
 #define ETH_FLAG_REG_DIRTY  0x0010  // DEPRECATED - FPGA handles registers directly
-#define ETH_FLAG_ENABLED    0x0020  // Ethernet is enabled
+#define ETH_FLAG_ENABLED    0x0020  // FPGA reports Ethernet enabled state
+
+#define ETH_FLAG_HPS_OWNED_MASK   (ETH_FLAG_RESET | ETH_FLAG_RX_AVAIL)
+#define ETH_FLAG_HPS_ACK_MASK     (ETH_FLAG_TX_REQ)
+#define ETH_FLAG_FPGA_MIRROR_MASK (ETH_FLAG_TX_REQ | ETH_FLAG_IRQ | ETH_FLAG_ENABLED)
 
 
 // Packet header structure (NE2000 format)
