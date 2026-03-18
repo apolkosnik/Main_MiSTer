@@ -124,7 +124,8 @@ static uint32_t eth_read_shared_u32(uint32_t offset)
 
 static uint32_t eth_update_shared_flags(uint32_t clear_mask, uint32_t set_mask)
 {
-    uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS);
+    uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS) & 0xFFFFu;
+    flags &= (ETH_FLAG_FPGA_MIRROR_MASK | ETH_FLAG_HPS_OWNED_MASK);
     flags = (flags & ~clear_mask) | set_mask;
     eth_write_shared_u32(ETH_CTRL_FLAGS, flags);
     return flags;
@@ -378,7 +379,8 @@ void minimig_eth_reset()
     memset(eth_shmem + ETH_PACKET_INFO, 0, 4);
 
     write_eth_state_stats(&state);
-    eth_update_shared_flags(ETH_FLAG_HPS_OWNED_MASK, 0);
+    eth_write_shared_u32(ETH_CTRL_FLAGS,
+                         eth_read_shared_u32(ETH_CTRL_FLAGS) & ETH_FLAG_FPGA_MIRROR_MASK);
     eth_write_shared_u32(ETH_HPS_SIGNATURE, 0xCAFEBABE);
     hps_heartbeat_counter = 0;
     eth_write_shared_u32(ETH_HPS_HEARTBEAT, hps_heartbeat_counter);
@@ -578,7 +580,7 @@ void transmit_packet()
 // Receive packet from host ethernet
 void receive_packet()
 {
-    uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS);
+    uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS) & 0xFFFFu;
     struct rtl8019_state state;
     read_eth_state(&state);
     if (raw_socket < 0 || !(flags & ETH_FLAG_ENABLED)) return;
@@ -656,7 +658,7 @@ void minimig_eth_poll()
 	else if(eth_shmem != (uint8_t *)-1)
 	{
         // Check for control flags from FPGA via shared memory
-        uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS);
+        uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS) & 0xFFFFu;
         
         // Update heartbeat counter every poll
         hps_heartbeat_counter++;
@@ -701,7 +703,7 @@ void minimig_eth_poll()
         // Handle reset request
         if (flags & ETH_FLAG_RESET) {
             minimig_eth_reset();
-            flags = eth_read_shared_u32(ETH_CTRL_FLAGS);
+            flags = eth_read_shared_u32(ETH_CTRL_FLAGS) & 0xFFFFu;
         }
         
         // Check for incoming packets
