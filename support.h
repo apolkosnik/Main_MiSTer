@@ -23,6 +23,9 @@
 // SNES  support
 #include "support/snes/snes.h"
 
+// MegaDrive  support
+#include "support/megadrive/mdplus.h"
+
 // N64  support
 #include "support/n64/n64.h"
 #include "support/n64/n64_joy_emu.h"
@@ -63,3 +66,6 @@
 // N64 support
 #include "support/n64/n64.h"
 #include "support/n64/n64_joy_emu.h"
+
+// 3DO  support
+#include "support/3do/3do.h"

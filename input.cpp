@@ -34,6 +34,8 @@
 #include "gamecontroller_db.h"
 #include "str_util.h"
 #include "frame_timer.h"
+#include "scaler.h"
+#include "file_io.h"
 
 #define NUMDEV 30
 #define UINPUT_NAME "MiSTer virtual input"
@@ -43,6 +45,62 @@ bool update_advanced_state(int devnum, uint16_t evcode, int evstate);
 char joy_bnames[NUMBUTTONS][32] = {};
 int  joy_bcount = 0;
 static struct pollfd pool[NUMDEV + 3];
+int  xbe2_shift = 0;
+
+static bool gcdb_use_usb_bcd_device(uint16_t vid, uint16_t pid)
+{
+	return (vid == 0x16D0 && (pid == 0x127E || pid == 0x1460)) // Reflex Adapt
+		|| (vid == 0x1209 && pid == 0x595A); // RetroZord
+}
+
+static bool read_sysfs_line(const char *path, char *buf, size_t buf_sz)
+{
+	if (!path || !buf || buf_sz < 2) return false;
+	if (!FileExists(path, 0)) return false;
+
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+
+	bool ok = fgets(buf, buf_sz, f) != NULL;
+	fclose(f);
+	if (!ok) return false;
+
+	buf[strcspn(buf, "\r\n")] = 0;
+	return buf[0] != 0;
+}
+
+static uint16_t get_usb_bcd_device_version(const char *sysfs, uint16_t bustype, uint16_t fallback_version)
+{
+	if (!sysfs || !sysfs[0] || bustype != BUS_USB) return fallback_version;
+
+	static char path[1024];
+	snprintf(path, sizeof(path), "/sys%s", sysfs);
+
+	for (;;)
+	{
+		size_t len = strlen(path);
+		if (len + sizeof("/bcdDevice") < sizeof(path))
+		{
+			strcpy(path + len, "/bcdDevice");
+
+			char bcd_buf[32] = {};
+			if (read_sysfs_line(path, bcd_buf, sizeof(bcd_buf)))
+			{
+				char *end = NULL;
+				unsigned long val = strtoul(bcd_buf, &end, 16);
+				if (end != bcd_buf && val <= 0xFFFF) return (uint16_t)val;
+			}
+
+			path[len] = 0;
+		}
+
+		char *slash = strrchr(path, '/');
+		if (!slash || slash <= path + 4) break;
+		*slash = 0;
+	}
+
+	return fallback_version;
+}
 
 static int ev2amiga[] =
 {
@@ -1085,6 +1143,266 @@ static int ev2archie[] =
 	NONE  //255 ???
 };
 
+static const int shifted[256] =
+{
+	0, //0   KEY_RESERVED
+	0, //1   KEY_ESC
+	KEY_F1, //2   KEY_1
+	KEY_F2, //3   KEY_2
+	KEY_F3, //4   KEY_3
+	KEY_F4, //5   KEY_4
+	KEY_F5, //6   KEY_5
+	KEY_F6, //7   KEY_6
+	KEY_F7, //8   KEY_7
+	KEY_F8, //9   KEY_8
+	KEY_F9, //10  KEY_9
+	KEY_F10, //11  KEY_0
+	0, //12  KEY_MINUS
+	0, //13  KEY_EQUAL
+	KEY_DELETE, //14  KEY_BACKSPACE
+	0, //15  KEY_TAB
+	KEY_HOME, //16  KEY_Q
+	KEY_UP, //17  KEY_W
+	KEY_END, //18  KEY_E
+	KEY_PAGEUP, //19  KEY_R
+	0, //20  KEY_T
+	0, //21  KEY_Y
+	0, //22  KEY_U
+	KEY_INSERT, //23  KEY_I
+	KEY_F11, //24  KEY_O
+	KEY_F12, //25  KEY_P
+	0, //26  KEY_LEFTBRACE
+	0, //27  KEY_RIGHTBRACE
+	KEY_ESC, //28  KEY_ENTER
+	0, //29  KEY_LEFTCTRL
+	KEY_LEFT, //30  KEY_A
+	KEY_DOWN, //31  KEY_S
+	KEY_RIGHT, //32  KEY_D
+	KEY_PAGEDOWN, //33  KEY_F
+	0, //34  KEY_G
+	0, //35  KEY_H
+	0, //36  KEY_J
+	0, //37  KEY_K
+	0, //38  KEY_L
+	0, //39  KEY_SEMICOLON  ;
+	0, //40  KEY_APOSTROPHE
+	0, //41  KEY_GRAVE
+	0, //42  KEY_LEFTSHIFT
+	0, //43  KEY_BACKSLASH
+	0, //44  KEY_Z
+	0, //45  KEY_X
+	0, //46  KEY_C
+	0, //47  KEY_V
+	0, //48  KEY_B
+	0, //49  KEY_N
+	0, //50  KEY_M
+	0, //51  KEY_COMMA
+	0, //52  KEY_DOT
+	0, //53  KEY_SLASH
+	0, //54  KEY_RIGHTSHIFT
+	0, //55  KEY_KPASTERISK
+	0, //56  KEY_LEFTALT
+	KEY_TAB, //57  KEY_SPACE
+	0, //58  KEY_CAPSLOCK
+	0, //59  KEY_F1
+	0, //60  KEY_F2
+	0, //61  KEY_F3
+	0, //62  KEY_F4
+	0, //63  KEY_F5
+	0, //64  KEY_F6
+	0, //65  KEY_F7
+	0, //66  KEY_F8
+	0, //67  KEY_F9
+	0, //68  KEY_F10
+	0, //69  KEY_NUMLOCK
+	0, //70  KEY_SCROLLLOCK
+	0, //71  KEY_KP7
+	0, //72  KEY_KP8
+	0, //73  KEY_KP9
+	0, //74  KEY_KPMINUS
+	0, //75  KEY_KP4
+	0, //76  KEY_KP5
+	0, //77  KEY_KP6
+	0, //78  KEY_KPPLUS
+	0, //79  KEY_KP1
+	0, //80  KEY_KP2
+	0, //81  KEY_KP3
+	0, //82  KEY_KP0
+	0, //83  KEY_KPDOT
+	0, //84  ???
+	0, //85  KEY_ZENKAKU
+	0, //86  KEY_102ND
+	0, //87  KEY_F11
+	0, //88  KEY_F12
+	0, //89  KEY_RO
+	0, //90  KEY_KATAKANA
+	0, //91  KEY_HIRAGANA
+	0, //92  KEY_HENKAN
+	0, //93  KEY_KATAKANA
+	0, //94  KEY_MUHENKAN
+	0, //95  KEY_KPJPCOMMA
+	0, //96  KEY_KPENTER
+	0, //97  KEY_RIGHTCTRL
+	0, //98  KEY_KPSLASH
+	0, //99  KEY_SYSRQ
+	0, //100 KEY_RIGHTALT
+	0, //101 KEY_LINEFEED
+	0, //102 KEY_HOME
+	KEY_PAGEUP, //103 KEY_UP
+	0, //104 KEY_PAGEUP
+	KEY_HOME, //105 KEY_LEFT
+	KEY_END, //106 KEY_RIGHT
+	0, //107 KEY_END
+	KEY_PAGEDOWN, //108 KEY_DOWN
+	0, //109 KEY_PAGEDOWN
+	0, //110 KEY_INSERT
+	0, //111 KEY_DELETE
+	0, //112 KEY_MACRO
+	0, //113 KEY_MUTE
+	0, //114 KEY_VOLUMEDOWN
+	0, //115 KEY_VOLUMEUP
+	0, //116 KEY_POWER
+	0, //117 KEY_KPEQUAL
+	0, //118 KEY_KPPLUSMINUS
+	0, //119 KEY_PAUSE
+	0, //120 KEY_SCALE
+	0, //121 KEY_KPCOMMA
+	0, //122 KEY_HANGEUL
+	0, //123 KEY_HANJA
+	0, //124 KEY_YEN
+	0, //125 KEY_LEFTMETA
+	0, //126 KEY_RIGHTMETA
+	0, //127 KEY_COMPOSE
+	0, //128 KEY_STOP
+	0, //129 KEY_AGAIN
+	0, //130 KEY_PROPS
+	0, //131 KEY_UNDO
+	0, //132 KEY_FRONT
+	0, //133 KEY_COPY
+	0, //134 KEY_OPEN
+	0, //135 KEY_PASTE
+	0, //136 KEY_FIND
+	0, //137 KEY_CUT
+	0, //138 KEY_HELP
+	0, //139 KEY_MENU
+	0, //140 KEY_CALC
+	0, //141 KEY_SETUP
+	0, //142 KEY_SLEEP
+	0, //143 KEY_WAKEUP
+	0, //144 KEY_FILE
+	0, //145 KEY_SENDFILE
+	0, //146 KEY_DELETEFILE
+	0, //147 KEY_XFER
+	0, //148 KEY_PROG1
+	0, //149 KEY_PROG2
+	0, //150 KEY_WWW
+	0, //151 KEY_MSDOS
+	0, //152 KEY_SCREENLOCK
+	0, //153 KEY_DIRECTION
+	0, //154 KEY_CYCLEWINDOWS
+	0, //155 KEY_MAIL
+	0, //156 KEY_BOOKMARKS
+	0, //157 KEY_COMPUTER
+	0, //158 KEY_BACK
+	0, //159 KEY_FORWARD
+	0, //160 KEY_CLOSECD
+	0, //161 KEY_EJECTCD
+	0, //162 KEY_EJECTCLOSECD
+	0, //163 KEY_NEXTSONG
+	0, //164 KEY_PLAYPAUSE
+	0, //165 KEY_PREVIOUSSONG
+	0, //166 KEY_STOPCD
+	0, //167 KEY_RECORD
+	0, //168 KEY_REWIND
+	0, //169 KEY_PHONE
+	0, //170 KEY_ISO
+	0, //171 KEY_CONFIG
+	0, //172 KEY_HOMEPAGE
+	0, //173 KEY_REFRESH
+	0, //174 KEY_EXIT
+	0, //175 KEY_MOVE
+	0, //176 KEY_EDIT
+	0, //177 KEY_SCROLLUP
+	0, //178 KEY_SCROLLDOWN
+	0, //179 KEY_KPLEFTPAREN
+	0, //180 KEY_KPRIGHTPAREN
+	0, //181 KEY_NEW
+	0, //182 KEY_REDO
+	0, //183 KEY_F13
+	0, //184 KEY_F14
+	0, //185 KEY_F15
+	0, //186 KEY_F16
+	0, //187 KEY_F17
+	0, //188 KEY_F18
+	0, //189 KEY_F19
+	0, //190 KEY_F20
+	0, //191 KEY_F21
+	0, //192 KEY_F22
+	0, //193 KEY_F23
+	0, //194 U-mlaut on DE mapped to backslash
+	0, //195 ???
+	0, //196 ???
+	0, //197 ???
+	0, //198 ???
+	0, //199 ???
+	0, //200 KEY_PLAYCD
+	0, //201 KEY_PAUSECD
+	0, //202 KEY_PROG3
+	0, //203 KEY_PROG4
+	0, //204 KEY_DASHBOARD
+	0, //205 KEY_SUSPEND
+	0, //206 KEY_CLOSE
+	0, //207 KEY_PLAY
+	0, //208 KEY_FASTFORWARD
+	0, //209 KEY_BASSBOOST
+	0, //210 KEY_PRINT
+	0, //211 KEY_HP
+	0, //212 KEY_CAMERA
+	0, //213 KEY_SOUND
+	0, //214 KEY_QUESTION
+	0, //215 KEY_EMAIL
+	0, //216 KEY_CHAT
+	0, //217 KEY_SEARCH
+	0, //218 KEY_CONNECT
+	0, //219 KEY_FINANCE
+	0, //220 KEY_SPORT
+	0, //221 KEY_SHOP
+	0, //222 KEY_ALTERASE
+	0, //223 KEY_CANCEL
+	0, //224 KEY_BRIGHT_DOWN
+	0, //225 KEY_BRIGHT_UP
+	0, //226 KEY_MEDIA
+	0, //227 KEY_SWITCHVIDEO
+	0, //228 KEY_DILLUMTOGGLE
+	0, //229 KEY_DILLUMDOWN
+	0, //230 KEY_DILLUMUP
+	0, //231 KEY_SEND
+	0, //232 KEY_REPLY
+	0, //233 KEY_FORWARDMAIL
+	0, //234 KEY_SAVE
+	0, //235 KEY_DOCUMENTS
+	0, //236 KEY_BATTERY
+	0, //237 KEY_BLUETOOTH
+	0, //238 KEY_WLAN
+	0, //239 KEY_UWB
+	0, //240 KEY_UNKNOWN
+	0, //241 KEY_VIDEO_NEXT
+	0, //242 KEY_VIDEO_PREV
+	0, //243 KEY_BRIGHT_CYCLE
+	0, //244 KEY_BRIGHT_AUTO
+	0, //245 KEY_DISPLAY_OFF
+	0, //246 KEY_WWAN
+	0, //247 KEY_RFKILL
+	0, //248 KEY_MICMUTE
+	0, //249 ???
+	0, //250 ???
+	0, //251 ???
+	0, //252 ???
+	0, //253 ???
+	0, //254 ???
+	0  //255 ???
+};
+
 
 uint8_t ps2_kbd_scan_set = 2;
 uint32_t get_ps2_code(uint16_t key)
@@ -1132,11 +1450,12 @@ enum QUIRK
 	QUIRK_LIGHTGUN,
 	QUIRK_LIGHTGUN_MOUSE,
 	QUIRK_WHEEL,
+	QUIRK_SHIFT,
 };
 
 typedef struct
 {
-	uint16_t bustype, vid, pid, version;
+	uint16_t bustype, vid, pid, version, gcdb_version;
 	char     idstr[256];
 	char     mod;
 
@@ -1558,7 +1877,7 @@ void finish_map_setting(int dismiss)
 	if (mapping_type == 3)
 	{
 		if (!dismiss) return;
-		if (mapping_count == 3) 
+		if (mapping_count == 3)
 		{
 			input_advanced_clear(mapping_dev);
 			if (mapping_store) memset(mapping_store, 0, sizeof(advancedButtonMap));
@@ -1841,7 +2160,7 @@ static inline float boxradf(const float angle)
 
 static void joy_apply_deadzone(int* x, int* y, const devInput* dev, const int stick) {
 	// Don't be fancy with such a small deadzone.
-	if (dev->deadzone <= 2) 
+	if (dev->deadzone <= 2)
 	{
 		if (dev->deadzone && (abs((*x > *y) == (*x > -*y) ? *x : *y) <= dev->deadzone))
 			*x = *y = 0;
@@ -1901,7 +2220,7 @@ static bool handle_autofire_toggle(int num, uint32_t mask, uint32_t code, char p
 			{
 				if (lastcode[num] == code) { // build up mask if multiple buttons map to same code
 					lastmask[num] |= mask; 	 // this can't happen at present but if it ever does it will work correctly
-											
+
 				} else {
 					lastcode[num] = code;
 					lastmask[num] = mask;
@@ -1926,7 +2245,7 @@ static bool handle_autofire_toggle(int num, uint32_t mask, uint32_t code, char p
 		{
 			char *strat = str;
 			inc_autofire_code(num, lastcode[num], lastmask[num]);
-			
+
 			// display autofire status for each button in the mask
 			FOR_EACH_SET_BIT(lastmask[num], btn) {
 				if (btn < 4) {
@@ -2132,7 +2451,7 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 			ev.value = press;
 
 			int cfg_switch = menu_allow_cfg_switch() && (osdbtn & JOY_BTN2) && press;
-			
+
 			switch (mask)
 			{
 			case JOY_RIGHT:
@@ -2263,7 +2582,7 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 static bool joy_dir_is_diagonal(const int x, const int y)
 {
 	static const float JOY_DIAG_THRESHOLD = .85f;
-	
+
 	return
 		((x == 0) || (y == 0)) ? false :
 		((x == y) || (x == -y)) ? true :
@@ -2686,14 +3005,14 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 		{
 			if (!load_map(get_map_name(dev, 1), &input[dev].mmap, sizeof(input[dev].mmap)))
 			{
-				if (!gcdb_map_for_controller(input[sub_dev].bustype, input[sub_dev].vid, input[sub_dev].pid, input[sub_dev].version, pool[sub_dev].fd, input[dev].mmap))
+				if (!gcdb_map_for_controller(input[sub_dev].bustype, input[sub_dev].vid, input[sub_dev].pid, input[sub_dev].gcdb_version, pool[sub_dev].fd, input[dev].mmap))
 				{
 					memset(input[dev].mmap, 0, sizeof(input[dev].mmap));
 					memcpy(input[dev].mmap, def_mmap, sizeof(def_mmap));
 					//input[dev].has_mmap++;
 				}
 			} else {
-				gcdb_show_string_for_ctrl_map(input[sub_dev].bustype, input[sub_dev].vid, input[sub_dev].pid, input[sub_dev].version, pool[sub_dev].fd, input[sub_dev].name, input[dev].mmap);
+				gcdb_show_string_for_ctrl_map(input[sub_dev].bustype, input[sub_dev].vid, input[sub_dev].pid, input[sub_dev].gcdb_version, pool[sub_dev].fd, input[sub_dev].name, input[dev].mmap);
 			}
 			if (!input[dev].mmap[SYS_BTN_OSD_KTGL + 2]) input[dev].mmap[SYS_BTN_OSD_KTGL + 2] = input[dev].mmap[SYS_BTN_OSD_KTGL + 1];
 
@@ -2903,7 +3222,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 
 	//mapping
-	
+
 	if (mapping && mapping_type == 3 && ev->type == EV_KEY)
 	{
 		bool jkm_can_intr = mapping_count == 3 && mapping_button <= 1 && mapping_set == 1;
@@ -2918,7 +3237,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 		if (ev->value == 1)
 		{
-			uint16_t *code_store = mapping_set ==  1 ? mapping_store->input_codes : mapping_store->output_codes; 
+			uint16_t *code_store = mapping_set ==  1 ? mapping_store->input_codes : mapping_store->output_codes;
 			code_store[mapping_button++] = ev->code;
 			mapping_current_dev = mapping_dev;
 			if (mapping_button == sizeof(mapping_store->input_codes)/sizeof(mapping_store->input_codes[0])) //Don't overflow, just keep replacing the last entry
@@ -3426,7 +3745,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 						if (input[dev].has_map == 3) Info("This joystick is not defined");
 						input[dev].has_map = 1;
 					}
-					
+
 					for (uint i = 0; i < BTN_NUM; i++)
 					{
 						if (ev->code == (input[dev].map[i] & 0xFFFF) || ev->code == (input[dev].map[i] >> 16)) {
@@ -3852,6 +4171,7 @@ void mergedevs()
 	make_unique(0x8282, 0x3201, 1);  // Irken Labs JAMMA Expander / Mojo Retro Adapter
 	make_unique(0x1209, 0xFACA, 1);  // ControllaBLE
 	make_unique(0x16D0, 0x127E, 1);  // Reflex Adapt to USB
+	make_unique(0x16D0, 0x1460, 1);  // Reflex Adapt Classic2USB
 	make_unique(0x1209, 0x595A, 1);  // RetroZord adapter
 
 	if (cfg.no_merge_vid)
@@ -3889,6 +4209,7 @@ void mergedevs()
 				input[i].vid = input[j].vid;
 				input[i].pid = input[j].pid;
 				input[i].version = input[j].version;
+				input[i].gcdb_version = input[j].gcdb_version;
 				input[i].bustype = input[j].bustype;
 				input[i].quirk = input[j].quirk;
 				memcpy(input[i].name, input[j].name, sizeof(input[i].name));
@@ -4790,11 +5111,13 @@ static void setup_wheels()
 
 int input_test(int getchar)
 {
+	PROFILE_FUNCTION();
 	static char cur_leds = 0;
 	static int state = 0;
 	struct input_absinfo absinfo;
 	struct input_event ev;
 	static uint32_t timeout = 0;
+	static int stick_debug = 0;
 
 	if (touch_rel && CheckTimer(touch_rel))
 	{
@@ -4871,6 +5194,7 @@ int input_test(int getchar)
 							input[n].vid = id.vendor;
 							input[n].pid = id.product;
 							input[n].version = id.version;
+							input[n].gcdb_version = id.version;
 							input[n].bustype = id.bustype;
 
 							ioctl(pool[n].fd, EVIOCGUNIQ(sizeof(uniq)), uniq);
@@ -5110,21 +5434,21 @@ int input_test(int getchar)
 							input_lightgun_load(n);
 						}
 
-						//Sinden Lightgun (two different PIDs, four different PIDs depending on gun color/config)                                                                                                   
-						if ((input[n].vid == 0x16c0 || input[n].vid == 0x16d0) && (                             
-            					input[n].pid == 0x0f01 ||                             
-            					input[n].pid == 0x0f02 ||                             
-            					input[n].pid == 0x0f38 ||                             
-            					input[n].pid == 0x0f39))                             
-						{                             
-    							input[n].quirk = QUIRK_LIGHTGUN;                             
-    							input[n].lightgun = 1;                             
-    							input[n].guncal[0] = 0;                             
-    							input[n].guncal[1] = 65535;                             
-    							input[n].guncal[2] = 0;                             
-    							input[n].guncal[3] = 65535;                             
-    							input_lightgun_load(n);                             
-						} 
+						//Sinden Lightgun (two different PIDs, four different PIDs depending on gun color/config)
+						if ((input[n].vid == 0x16c0 || input[n].vid == 0x16d0) && (
+            					input[n].pid == 0x0f01 ||
+            					input[n].pid == 0x0f02 ||
+            					input[n].pid == 0x0f38 ||
+            					input[n].pid == 0x0f39))
+						{
+    							input[n].quirk = QUIRK_LIGHTGUN;
+    							input[n].lightgun = 1;
+    							input[n].guncal[0] = 0;
+    							input[n].guncal[1] = 65535;
+    							input[n].guncal[2] = 0;
+    							input[n].guncal[3] = 65535;
+    							input_lightgun_load(n);
+						}
 
 						//Madcatz Arcade Stick 360
 						if (input[n].vid == 0x0738 && input[n].pid == 0x4758) input[n].quirk = QUIRK_MADCATZ360;
@@ -5167,7 +5491,7 @@ int input_test(int getchar)
 						//Arduino and Teensy devices may share the same VID:PID, so additional field UNIQ is used to differentiate them
 						//Reflex Adapt also uses the UNIQ field to differentiate between device modes
 						//RetroZord Adapter also uses the UNIQ field to differentiate between device modes
-						if ((input[n].vid == 0x2341 || (input[n].vid == 0x16C0 && (input[n].pid>>8) == 0x4) || (input[n].vid == 0x16D0 && input[n].pid == 0x127E) || (input[n].vid == 0x1209 && input[n].pid == 0x595A)) && strlen(uniq))
+						if ((input[n].vid == 0x2341 || (input[n].vid == 0x16C0 && (input[n].pid>>8) == 0x4) || (input[n].vid == 0x16D0 && (input[n].pid == 0x127E || input[n].pid == 0x1460)) || (input[n].vid == 0x1209 && input[n].pid == 0x595A)) && strlen(uniq))
 						{
 							snprintf(input[n].idstr, sizeof(input[n].idstr), "%04x_%04x_%s", input[n].vid, input[n].pid, uniq);
 							char *p;
@@ -5192,6 +5516,10 @@ int input_test(int getchar)
 							snprintf(input[n].idstr, sizeof(input[n].idstr), "%04x_%04x", input[n].vid, input[n].pid);
 						}
 
+						//XBox Elite 2 controller, use paddles as a special shift for chatpad accessory.
+						//Works only through cable or USB dongle.
+						if (input[n].vid == 0x045e && input[n].pid == 0x0b00) input[n].quirk = QUIRK_SHIFT;
+
 						ioctl(pool[n].fd, EVIOCGRAB, (grabbed | user_io_osd_is_visible()) ? 1 : 0);
 
 						n++;
@@ -5202,6 +5530,19 @@ int input_test(int getchar)
 			closedir(d);
 
 			mergedevs();
+			for (int i = 0; i < n; i++)
+			{
+				input[i].gcdb_version = input[i].version;
+				if (gcdb_use_usb_bcd_device(input[i].vid, input[i].pid))
+				{
+					input[i].gcdb_version = get_usb_bcd_device_version(input[i].sysfs, input[i].bustype, input[i].version);
+					if (input[i].gcdb_version != input[i].version)
+					{
+						printf("Gamecontrollerdb: using USB bcdDevice %04x instead of input version %04x for %s\n",
+							input[i].gcdb_version, input[i].version, input[i].devname);
+					}
+				}
+			}
 			check_joycon();
 			openfire_signal();
 			setup_wheels();
@@ -5252,7 +5593,7 @@ int input_test(int getchar)
 
 		while (1)
 		{
-			
+
 			if (cfg.rumble && !is_menu())
 			{
 				for (int i = 0; i < NUMDEV; i++)
@@ -5297,7 +5638,6 @@ int input_test(int getchar)
 				{
 					if (!input[i].mouse)
 					{
-
 						memset(&ev, 0, sizeof(ev));
 						if (read(pool[i].fd, &ev, sizeof(ev)) == sizeof(ev))
 						{
@@ -5370,6 +5710,15 @@ int input_test(int getchar)
 									if (ioctl(pool[i].fd, EVIOCGABS(ev.code), &absinfo) < 0) memset(&absinfo, 0, sizeof(absinfo));
 									else
 									{
+										if (stick_debug & 4)
+										{
+											static int x = 0, y = 0;
+											if (ev.code == 0 || ev.code == 3 || ev.code == 2) x = (255 * (ev.value - absinfo.minimum)) / (absinfo.maximum - absinfo.minimum);
+											if (ev.code == 1 || ev.code == 4 || ev.code == 5) y = (255 * (ev.value - absinfo.minimum)) / (absinfo.maximum - absinfo.minimum);
+											dbg_draw_cursor(x, y);
+											if (ev.code <= 5) return 0;
+										}
+
 										//DS4 specific: touchpad as lightgun
 										if (input[i].quirk == QUIRK_DS4TOUCH && ev.code <= 1)
 										{
@@ -5451,6 +5800,10 @@ int input_test(int getchar)
 										else continue;
 									}
 								}
+
+								// Emulate keys absent on chatpad
+								if (input[dev].quirk == QUIRK_SHIFT && cfg.xbe2_shift && ev.code == cfg.xbe2_shift) xbe2_shift = ev.value;
+								if (xbe2_shift && ev.code <= 255 && shifted[ev.code]) ev.code = shifted[ev.code];
 
 								if (input[dev].quirk == QUIRK_VCS && !vcs_proc(i, &ev)) continue;
 
@@ -5544,6 +5897,13 @@ int input_test(int getchar)
 										//keyboard, buttons
 									case EV_KEY:
 										printf("%04x:%04x:%02d P%d Input event: type=EV_KEY, code=%d(0x%x), value=%d\n", input[dev].vid, input[dev].pid, i, input[dev].num, ev.code, ev.code, ev.value);
+										if (ev.code == 0x13d || ev.code == 0x13e || ev.code == 0x138 || ev.code == 0x139)
+										{
+											int mask = 1 << (ev.code & 1);
+											if (!ev.value) stick_debug &= ~mask;
+											else stick_debug |= mask;
+											if ((stick_debug & 3) == 3) stick_debug ^= 4;
+										}
 										break;
 
 									case EV_REL:
@@ -5877,7 +6237,21 @@ int input_test(int getchar)
 					}
 					else if (!strncmp(cmd, "screenshot", 10))
 					{
-						user_io_screenshot_cmd(cmd);
+						char *p = cmd + 10;
+						int scaled = 0;
+
+						while (*p == ' ' || *p == '\t')
+							p++;
+
+						if (!strncmp(p, "scaled", 6) && (p[6] == '\0' || p[6] == ' ' || p[6] == '\t'))
+						{
+							scaled = 1;
+							p += 6;
+
+							while (*p == ' ' || *p == '\t')
+								p++;
+						}
+						request_screenshot(p, scaled);
 					}
 					else if (!strncmp(cmd, "volume ", 7))
 					{
@@ -5927,7 +6301,7 @@ int input_test(int getchar)
 	return 0;
 }
 
-void key_update_frames_held()
+void key_update_frames_held_cb(void)
 {
 	for (int i = 0; i < NUMPLAYERS; i++) {
 		for (int k = 0; k < key_states[i].count; k++) {
@@ -5942,18 +6316,16 @@ void key_update_frames_held()
 
 int input_poll(int getchar)
 {
+	#ifdef PROFILING
+		PROFILE_FUNCTION();
+	#endif
 
-	static int poll_cnt = 0;
-	PROFILE_FUNCTION();
 	static bool autofire_cfg_parsed = false;
  	if (!autofire_cfg_parsed) autofire_cfg_parsed = parse_autofire_cfg();
 	static uint32_t joy_mask_prev[NUMPLAYERS] = {};
-	
-	// FRAME_TICK compares against frame_timer's counter (updated elsewhere) and fires once per frame.
-	static uint32_t last_frame_count = 0;
-	if (FRAME_TICK(last_frame_count)) {
-		key_update_frames_held();
-	}
+
+	add_frame_callback(key_update_frames_held_cb);
+
 
 	int ret = input_test(getchar);
 	if (getchar) return ret;
@@ -6175,7 +6547,7 @@ static void advanced_convert_jkmap(int devnum)
 		  if (jkmap[i])
 		  {
 			  advancedButtonMap *abm = &input[devnum].advanced_map[abmidx++];
-		    memset(abm, 0, sizeof(advancedButtonMap));	
+		    memset(abm, 0, sizeof(advancedButtonMap));
 			  abm->input_codes[0] = i;
 			  abm->output_codes[0] = jkmap[i];
 		  }
@@ -6214,10 +6586,11 @@ static uint32_t process_abm_entry(advancedButtonMap *abm, advancedButtonState *a
 				struct input_event ev;
 				ev.code = ocode;
 				ev.value = abs->pressed;
+				ev.type = EV_KEY;
 				input_cb(&ev, NULL, devnum, true);
 				input[devnum].advanced_last_pressed_keycode = abs->pressed ? ocode : 0;
 			} else {
-				retmask |= omask; 
+				retmask |= omask;
 			}
 		}
 	}
@@ -6245,7 +6618,7 @@ uint8_t advanced_entry_pressed_state(advancedButtonMap *abm, advancedButtonState
 				abs->input_state &= ~(1<<i);
 		}
 		code_cnt++;
-		if (abs->input_state & 1<<i) pressed_cnt++; 
+		if (abs->input_state & 1<<i) pressed_cnt++;
 		if (abm->input_codes[i] == input[devnum].mmap[SYS_BTN_OSD_KTGL+1] || abm->input_codes[i] == input[devnum].mmap[SYS_BTN_OSD_KTGL+2])
 			chord_has_osd = true;
 	}
@@ -6254,7 +6627,7 @@ uint8_t advanced_entry_pressed_state(advancedButtonMap *abm, advancedButtonState
 		is_pressed = false;
 
 	//if a chord contains the OSD button(s) they have to be first, otherwise it might
-	//interfere with autofire chording. 
+	//interfere with autofire chording.
 	if (code_is_osd_btn && evstate && chord_has_osd && pressed_cnt > 1)
 		is_pressed = false;
 
@@ -6271,7 +6644,8 @@ bool update_advanced_state(int devnum, uint16_t evcode, int evstate)
 	{
 		struct input_event ev;
 		ev.code = input[devnum].advanced_last_pressed_keycode;
-		ev.value = evstate; 
+		ev.value = evstate;
+		ev.type = EV_KEY;
 		input_cb(&ev, NULL, devnum, true);
 		return false;
 	}
@@ -6293,7 +6667,7 @@ bool update_advanced_state(int devnum, uint16_t evcode, int evstate)
 
 		uint8_t pressed_state  = advanced_entry_pressed_state(abm, abs, evcode, evstate, devnum);
 		bool is_pressed = pressed_state & 1;
-		bool chord_has_osd = pressed_state & (1 << 1); 
+		bool chord_has_osd = pressed_state & (1 << 1);
 		abs->last_pressed = abs->pressed;
 		abs->pressed = is_pressed;
 
@@ -6313,11 +6687,12 @@ bool update_advanced_state(int devnum, uint16_t evcode, int evstate)
 				if (!imask && icode <= 256) //Keyboard
 				{
 
-					if (icode != evcode) 
+					if (icode != evcode)
 					{
 						struct input_event ev;
-						ev.code = icode; 
-						ev.value = !abs->pressed; 
+						ev.code = icode;
+						ev.value = !abs->pressed;
+						ev.type = EV_KEY;
 						input_cb(&ev, NULL, devnum, true);
 					}
 				} else {  //Joypad
@@ -6341,7 +6716,7 @@ bool update_advanced_state(int devnum, uint16_t evcode, int evstate)
 		}
 	}
 
-	//If this return is true input_cb inhibits sending the keyboard event to the core. 
+	//If this return is true input_cb inhibits sending the keyboard event to the core.
 	//Needed so the core doesn't see a keyboard event for the last key in a chord
 	//(or when a single key has been remapped)
 	return allow_keysend;
@@ -6354,7 +6729,7 @@ advancedButtonMap *get_advanced_map_defs(int devnum)
 		return NULL;
 	}
 	devnum = input[devnum].bind;
-	return input[devnum].advanced_map; 
+	return input[devnum].advanced_map;
 }
 
 void get_button_name_for_code(uint16_t btn_code, int devnum, char *bname, size_t bname_sz)
@@ -6432,7 +6807,7 @@ void input_advanced_save(int dev_num, bool do_delete)
 		if (do_delete)
 			FileDeleteConfig(path);
 		else
-			FileSaveConfig(path, input[dev_num].advanced_map, bufsize); 
+			FileSaveConfig(path, input[dev_num].advanced_map, bufsize);
 	}
 }
 
@@ -6444,13 +6819,13 @@ void input_advanced_load(int dev_num)
 	if (buf)
 	{
 		dev_num = input[dev_num].bind;
-		memset(buf, 0, bufsize); 
+		memset(buf, 0, bufsize);
 		char fname[256] = {};
-		input_advanced_save_filename(fname, sizeof(fname), dev_num, false); 
+		input_advanced_save_filename(fname, sizeof(fname), dev_num, false);
 		strncat(path, fname, sizeof(path)-1);
 		if (FileLoadConfig(path, buf, bufsize))
 		{
-			memcpy(input[dev_num].advanced_map, buf, bufsize); 
+			memcpy(input[dev_num].advanced_map, buf, bufsize);
 			for(int i = 0; i < ADVANCED_MAP_MAX; i++)
 			{
 				advancedButtonMap *abm = &input[dev_num].advanced_map[i];
@@ -6476,7 +6851,7 @@ advancedButtonMap *input_advanced_find_match(advancedButtonMap *newMap, int devn
 		for(size_t j = 0; j < 4; j++)
 		{
 
-      uint16_t scode = newMap->input_codes[j];	
+      uint16_t scode = newMap->input_codes[j];
 			if (scode != 0) jcnt++;
 			kcnt = 0;
 			for(size_t k = 0; k < 4; k++)
@@ -6501,14 +6876,14 @@ void input_advanced_clear(int devnum)
 void input_advanced_delete(advancedButtonMap *todel, int devnum)
 {
 	if (devnum <0 || devnum >= NUMDEV) return;
-	if (todel < input[devnum].advanced_map || todel > &input[devnum].advanced_map[ADVANCED_MAP_MAX-1]) 
+	if (todel < input[devnum].advanced_map || todel > &input[devnum].advanced_map[ADVANCED_MAP_MAX-1])
 	{
 		memset(todel, 0, sizeof(advancedButtonMap));
 		return;
 	}
 
 	//endptr is not a valid ABM, but it is a pointer to just after the last one
-	//only used for address calculation in memmove. 
+	//only used for address calculation in memmove.
 	advancedButtonMap *endptr = &input[devnum].advanced_map[ADVANCED_MAP_MAX];
 	memmove(todel, todel+1, (sizeof(advancedButtonMap)*(endptr-(todel+1))));
 	input_advanced_save(devnum);

@@ -132,6 +132,8 @@ typedef struct {
 #define TC_MODE_SDX_SIDE2	0x4C
 #define TC_MODE_SDX_U1MB	0x4D
 #define TC_MODE_DB_32		0x70
+#define TC_MODE_CORINA_512      0x71
+#define TC_MODE_CORINA_1024     0x72
 #define TC_MODE_BOUNTY_40	0x73
 
 static const cart_def_t cart_def[] = 
@@ -204,6 +206,8 @@ static const cart_def_t cart_def[] =
 	{ 76, "Williams       ", TC_MODE_WILLIAMS16,     16 },
 	{ 80, "JRC-Linear     ", TC_MODE_JRC_LIN_64,     64 },
 	{ 83, "S.I.C.+        ", TC_MODE_SIC_1024,     1024 },
+	{ 84, "Corina w/EEPROM", TC_MODE_CORINA_1024,  1032 },
+	{ 85, "Corina w/EEPROM", TC_MODE_CORINA_512,    520 },
 	{ 86, "XE Multicart   ", TC_MODE_XEMULTI_8,       8 },
 	{ 87, "XE Multicart   ", TC_MODE_XEMULTI_16,     16 },
 	{ 88, "XE Multicart   ", TC_MODE_XEMULTI_32,     32 },
@@ -264,40 +268,46 @@ static uint16_t get_a800_reg2(uint8_t reg)
 static uint8_t mounted_cart1_type;
 static uint8_t mounted_cart2_type;
 static int mounted_cart1_size;
+static fileTYPE cart1_file = {};
+static fileTYPE cart2_file = {};
 
-static void reboot(uint8_t cold, uint8_t pause)
+static void reboot_800(uint8_t cold, uint8_t pause, uint8_t phase = 3)
 {
 	int i;
 
-	set_a8bit_reg(REG_PAUSE, 1);
-	if (cold)
+	if(phase & 0x01)
 	{
-		set_a8bit_reg(REG_FREEZER, 0);
-		set_a8bit_reg(REG_CART1_SELECT, 0);
-		set_a8bit_reg(REG_CART2_SELECT, 0);
-		// Initialize the first 64K of SDRAM with a pattern
-		for(i = 0; i < BUFFER_SIZE; i += 2)
+		set_a8bit_reg(REG_PAUSE, 1);
+		if (cold)
 		{
-			a8bit_buffer[i] = 0xFF;
-			a8bit_buffer[i+1] = 0x00;
-		}
-		user_io_set_index(99);
-		user_io_set_download(1, SDRAM_BASE);
-		for(i = 0; i < 0x10000 / BUFFER_SIZE; i++) user_io_file_tx_data(a8bit_buffer, BUFFER_SIZE);
-		user_io_set_download(0);
-		if(mounted_cart1_type)
-		{
-			set_a8bit_reg(REG_CART1_SELECT, mounted_cart1_type);
+			set_a8bit_reg(REG_FREEZER, 0);
+			set_a8bit_reg(REG_CART1_SELECT, 0);
+			set_a8bit_reg(REG_CART2_SELECT, 0);
+			// Initialize the first 64K of SDRAM with a pattern
+			for(i = 0; i < BUFFER_SIZE; i += 2)
+			{
+				a8bit_buffer[i] = 0xFF;
+				a8bit_buffer[i+1] = 0x00;
+			}
+			user_io_set_index(99);
+			user_io_set_download(1, SDRAM_BASE);
+			for(i = 0; i < 0x10000 / BUFFER_SIZE; i++) user_io_file_tx_data(a8bit_buffer, BUFFER_SIZE);
+			user_io_set_download(0);
+			if(mounted_cart1_type)
+			{
+				set_a8bit_reg(REG_CART1_SELECT, mounted_cart1_type);
+			}
+			else
+			{
+				mounted_cart1_size = 0;
+			}
+			if(mounted_cart2_type) set_a8bit_reg(REG_CART2_SELECT, mounted_cart2_type);
 		}
 		else
 		{
-			mounted_cart1_size = 0;
+			FileClose(&xex_file);
 		}
-		if(mounted_cart2_type) set_a8bit_reg(REG_CART2_SELECT, mounted_cart2_type);
-	}
-	else
-	{
-		FileClose(&xex_file);
+		set_a8bit_reg(REG_XEX_LOADER, 0);
 	}
 	
 	// Both cold==1 and pause==1 is a special case when 
@@ -309,39 +319,52 @@ static void reboot(uint8_t cold, uint8_t pause)
 	// cycle does not allow to pre-init the OS to do a warm
 	// start, it will always be cold).
 
-	set_a8bit_reg(REG_XEX_LOADER, 0);
-
 	if((get_a8bit_reg(REG_ATARI_STATUS1) & STATUS1_MASK_MODE800) && (!cold || pause))
 	{
-		set_a8bit_reg(REG_RESET_RNMI, 1);
-		set_a8bit_reg(REG_RESET_RNMI, 0);
+		if(phase & 0x01) set_a8bit_reg(REG_RESET_RNMI, 1);
+		if(phase & 0x02) set_a8bit_reg(REG_RESET_RNMI, 0);
 	}
 	else
 	{
-		set_a8bit_reg(REG_RESET, 1);
-		set_a8bit_reg(REG_RESET, 0);
+		if(phase & 0x01) set_a8bit_reg(REG_RESET, 1);
+		if(phase & 0x02) set_a8bit_reg(REG_RESET, 0);
 	}
 
-	if(cold)
+	if(phase & 0x02)
 	{
-		set_a8bit_reg(REG_FREEZER, 1);
+		if(cold) set_a8bit_reg(REG_FREEZER, 1);
+		if(!pause) set_a8bit_reg(REG_PAUSE, 0);
 	}
-	set_a8bit_reg(REG_PAUSE, pause);
 }
 
 static void check_reset_pause()
 {
+	static uint8_t soft_reboot = 0;
+	static uint8_t cold_reboot = 0;
+
 	uint16_t atari_status1 = get_a8bit_reg(REG_ATARI_STATUS1);
 
-	set_a8bit_reg(REG_PAUSE, atari_status1 & STATUS1_MASK_HALT);
+	if(!(soft_reboot | cold_reboot)) set_a8bit_reg(REG_PAUSE, atari_status1 & STATUS1_MASK_HALT);
 
-	if (atari_status1 & STATUS1_MASK_SOFTBOOT)
+	if ((atari_status1 & STATUS1_MASK_SOFTBOOT) && !soft_reboot)
 	{
-		reboot(0, 0);
+		soft_reboot = 1;
+		reboot_800(0, 0, 1);
 	}
-	else if (atari_status1 & STATUS1_MASK_COLDBOOT)
+	else if(!(atari_status1 & STATUS1_MASK_SOFTBOOT) && soft_reboot)
 	{
-		reboot(1, 0);
+		soft_reboot = 0;
+		reboot_800(0, 0, 2);
+	}
+	else if ((atari_status1 & STATUS1_MASK_COLDBOOT) && !cold_reboot)
+	{
+		cold_reboot = 1;
+		reboot_800(1, 0, 1);
+	}
+	else if(!(atari_status1 & STATUS1_MASK_COLDBOOT) && cold_reboot)
+	{
+		cold_reboot = 0;
+		reboot_800(1, 0, 2);
 	}
 }
 
@@ -512,12 +535,14 @@ void atari800_umount_cartridge(uint8_t stacked)
 	if(stacked)
 	{
 		mounted_cart2_type = 0;
+		FileClose(&cart2_file);
 	}
 	else
 	{
 		mounted_cart1_type = 0;
+		FileClose(&cart1_file);
 	}
-	reboot(1, 0);
+	if(get_a8bit_reg(REG_ATARI_FLASH) & 0x10) reboot_800(1, 0);
 }
 
 int atari800_check_cartridge_file(const char* name, unsigned char index)
@@ -602,79 +627,87 @@ void atari800_open_cartridge_file(const char* name, int match_index)
 	uint8_t stacked = (cart_io_index & 0x3F) == 9;
 	uint8_t *buf = &a8bit_buffer[0];
 	uint8_t *buf2 = &a8bit_buffer[4096];
-	fileTYPE f = {};
+	fileTYPE *f = stacked ? &cart2_file : &cart1_file;
 	int offset = cart_match_car ? 16 : 0;
 	uint8_t cart_type = cart_def[cart_matches_idx[match_index]].cart_type;
 
-	if (FileOpen(&f, name))
+	FileClose(f);
+	
+	if (FileOpenEx(f, name, !FileCanWrite(name) || (get_a8bit_reg(REG_ATARI_STATUS1) & STATUS1_MASK_RDONLY) ? O_RDONLY : (O_RDWR | O_SYNC)))
 	{
-		set_a8bit_reg(REG_PAUSE, 1);
+		// set_a8bit_reg(REG_PAUSE, 1);
 
 		ProgressMessage(0, 0, 0, 0);
-		FileSeek(&f, offset, SEEK_SET);
+		FileSeek(f, offset, SEEK_SET);
 
 		user_io_set_index(cart_io_index);
 		user_io_set_download(1);
 	
 		if(cart_type == 3 || cart_type == 45)
 		{
-			ProgressMessage("Loading", f.name, 0, 6);
-			FileReadAdv(&f, buf, 4096);
+			ProgressMessage("Loading", f->name, 0, 6);
+			FileReadAdv(f, buf, 4096);
 			user_io_file_tx_data(buf, 4096);
 
-			if (cart_type == 3) FileSeek(&f, offset + 8192, SEEK_SET);
-			ProgressMessage("Loading", f.name, 1, 6);
-			FileReadAdv(&f, buf, 4096);
+			if (cart_type == 3) FileSeek(f, offset + 8192, SEEK_SET);
+			ProgressMessage("Loading", f->name, 1, 6);
+			FileReadAdv(f, buf, 4096);
 			user_io_file_tx_data(buf, 4096);
 
-			if (cart_type == 3) FileSeek(&f, offset + 4096, SEEK_SET);
-			ProgressMessage("Loading", f.name, 2, 6);
-			FileReadAdv(&f, buf2, 4096); // NOTE different buffer!
+			if (cart_type == 3) FileSeek(f, offset + 4096, SEEK_SET);
+			ProgressMessage("Loading", f->name, 2, 6);
+			FileReadAdv(f, buf2, 4096); // NOTE different buffer!
 			user_io_file_tx_data(buf2, 4096);
 			
-			if (cart_type == 3) FileSeek(&f, offset + 12288, SEEK_SET);
-			ProgressMessage("Loading", f.name, 3, 6);
-			FileReadAdv(&f, buf, 4096);
+			if (cart_type == 3) FileSeek(f, offset + 12288, SEEK_SET);
+			ProgressMessage("Loading", f->name, 3, 6);
+			FileReadAdv(f, buf, 4096);
 			user_io_file_tx_data(buf, 4096);
 			
-			FileSeek(&f, offset, SEEK_SET);
-			ProgressMessage("Loading", f.name, 4, 6);
-			FileReadAdv(&f, buf, 4096);
+			FileSeek(f, offset, SEEK_SET);
+			ProgressMessage("Loading", f->name, 4, 6);
+			FileReadAdv(f, buf, 4096);
 			for(int i = 0; i < 4096; i++) buf[i] &= buf2[i];
 			user_io_file_tx_data(buf, 4096);
 
-			if (cart_type == 3) FileSeek(&f, offset + 8192, SEEK_SET);
-			ProgressMessage("Loading", f.name, 5, 6);
-			FileReadAdv(&f, buf, 4096);
+			if (cart_type == 3) FileSeek(f, offset + 8192, SEEK_SET);
+			ProgressMessage("Loading", f->name, 5, 6);
+			FileReadAdv(f, buf, 4096);
 			for(int i = 0; i < 4096; i++) buf[i] &= buf2[i];
 			user_io_file_tx_data(buf, 4096);
 		}
 		else
 		{
-			while (offset < f.size)
+			while (offset < f->size)
 			{
-				int to_read = f.size - offset;
+				int to_read = f->size - offset;
 				if (to_read > BUFFER_SIZE) to_read = BUFFER_SIZE;
-				ProgressMessage("Loading", f.name, offset, f.size);
-				FileReadAdv(&f, a8bit_buffer, to_read);
+				ProgressMessage("Loading", f->name, offset, f->size + (cart_type == 85 ? 0x80000 : 0));
+				FileReadAdv(f, a8bit_buffer, to_read);
 				user_io_file_tx_data(a8bit_buffer, to_read);
 				offset += to_read;
 			}
+			if(cart_type == 85)
+			{
+				atari800_dma_read(a8bit_buffer, SDRAM_BASE + 0x880000 + (stacked ? 0x100000 : 0), 8192);
+				atari8bit_dma_write(a8bit_buffer, SDRAM_BASE + 0x900000 + (stacked ? 0x100000 : 0), 8192);
+				ProgressMessage("Loading", f->name, offset, f->size);
+				atari8bit_dma_zero(SDRAM_BASE + 0x880000 + (stacked ? 0x100000 : 0), 0x80000);
+			}
 		}
-		FileClose(&f);
 		user_io_set_download(0);
 		ProgressMessage(0, 0, 0, 0);
 		if(!stacked)
 		{
 			mounted_cart1_type = cart_matches_mode[match_index];
-			mounted_cart1_size = cart_match_car ? f.size - 16 : f.size;
+			mounted_cart1_size = cart_match_car ? f->size - 16 : f->size;
+			if(cart_type == 85) mounted_cart1_size += 0x80000;
 		}
 		else
 		{
 			mounted_cart2_type = cart_matches_mode[match_index];
 		}
-
-		reboot(1, 0);
+		if(get_a8bit_reg(REG_ATARI_FLASH) & 0x10) reboot_800(1, 0);
 	}
 }
 
@@ -683,7 +716,7 @@ void atari800_open_bios_file(const char* name, unsigned char index)
 	uint8_t bios_index = (index & 0x3F);
 	uint16_t mode800 = get_a8bit_reg(REG_ATARI_STATUS1) & STATUS1_MASK_MODE800;
 	user_io_file_tx(name, index);
-	if((mode800 && bios_index == 6) || (!mode800 && (bios_index == 4 || bios_index == 5))) reboot(1, 0);
+	if((mode800 && bios_index == 6) || (!mode800 && (bios_index == 4 || bios_index == 5))) reboot_800(1, 0);
 }
 
 #define MAX_DRIVES 15
@@ -826,7 +859,7 @@ enum atx_density { atx_single, atx_medium, atx_double };
 #define NUM_ATX_DRIVES 4
 
 #define XEX_SECTOR_SIZE 128
-#define ATARI_SECTOR_BUFFER_SIZE 512
+#define ATARI_SECTOR_BUFFER_SIZE 768 // Some ATX based operations may need to go beyond the 512 boundary
 
 static uint8_t atari_sector_buffer[ATARI_SECTOR_BUFFER_SIZE];
 static uint32_t pre_ce_delay;
@@ -902,13 +935,20 @@ static void wait_from_stamp(uint32_t us_delay)
 #define ATX_FILE_ACCESS_READ    1
 #define ATX_FILE_ACCESS_WRITE   2
 
-int atx_file_access(int drv_num, int type, int offset, int len)
+int atx_file_access(int drv_num, int type, int offset, int len, int sector_offset = 256)
 {
-	(void)type; // ATM we only support reading, but writing is potentially possible
-
 	FileSeek(&drive_infos[drv_num].file, offset, SEEK_SET);
 
-	return len == FileReadAdv(&drive_infos[drv_num].file, atari_sector_buffer, len);
+	if (type == ATX_FILE_ACCESS_READ)
+	{
+		return len == FileReadAdv(&drive_infos[drv_num].file, &atari_sector_buffer[sector_offset], len);
+	}
+	else if (type == ATX_FILE_ACCESS_WRITE)
+	{
+		return len == FileWriteAdv(&drive_infos[drv_num].file, &atari_sector_buffer[sector_offset], len);
+
+	}
+	return 0;
 }
 
 static uint8_t loadAtxFile(int drv_num)
@@ -917,7 +957,7 @@ static uint8_t loadAtxFile(int drv_num)
 	atxTrackHeader *trackHeader;
 	uint8_t r = 0;
 
-	if(!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, 0, sizeof(atxFileHeader))) return r;
+	if (!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, 0, sizeof(atxFileHeader), 0)) return r;
 
 	// validate the ATX file header
 	fileHeader = (atxFileHeader *) atari_sector_buffer;
@@ -938,7 +978,7 @@ static uint8_t loadAtxFile(int drv_num)
 	uint32_t startOffset = fileHeader->startData;
 
 	for(int track = 0; track < MAX_TRACK ; track++) {
-		if (!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, startOffset, sizeof(atxTrackHeader))) break;
+		if (!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, startOffset, sizeof(atxTrackHeader), 0)) break;
 		trackHeader = (atxTrackHeader *) atari_sector_buffer;
 		atx_info[drv_num].trackOffset[track] = startOffset;
 		startOffset += trackHeader->size;
@@ -949,9 +989,10 @@ static uint8_t loadAtxFile(int drv_num)
 
 // Return 0 on full success, 1 on "Atari disk problem" (may have data)
 // -1 on internal storage problem (corrupt ATX) 
-static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
+static int transferAtxSector(int drv_num, uint16_t num, uint8_t *status, int op_type = ATX_FILE_ACCESS_READ, uint8_t verify_op = 0)
 {
 
+	uint8_t *half_buf_ptr = &atari_sector_buffer[256];
 	atxTrackHeader *trackHeader;
 	atxSectorListHeader *slHeader;
 	atxSectorHeader *sectorHeader;
@@ -997,7 +1038,7 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 	{
 		if(atx_file_access(drv_num, ATX_FILE_ACCESS_READ, currentFileOffset, sizeof(atxTrackHeader)))
 		{
-			trackHeader = (atxTrackHeader *) atari_sector_buffer;
+			trackHeader = (atxTrackHeader *) half_buf_ptr;
 			sectorCount = trackHeader->sectorCount;
 		}
 		else
@@ -1016,9 +1057,9 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 	if (sectorCount)
 	{
 		currentFileOffset += trackHeaderSize;
-		if(atx_file_access(drv_num, ATX_FILE_ACCESS_READ, currentFileOffset, sizeof(atxSectorListHeader)))
+		if (atx_file_access(drv_num, ATX_FILE_ACCESS_READ, currentFileOffset, sizeof(atxSectorListHeader)))
 		{
-			slHeader = (atxSectorListHeader *) atari_sector_buffer;
+			slHeader = (atxSectorListHeader *) half_buf_ptr;
 			// sector list header is variable length, so skip any extra header bytes that may be present
 			currentFileOffset += slHeader->next - sectorCount * sizeof(atxSectorHeader);
 		}
@@ -1030,39 +1071,53 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 	}
 
 	uint32_t tgtSectorOffset;        // the offset of the target sector data
+	uint32_t writeStatusOffset;      // for the write operation, remember where to update the status bit
 	int16_t weakOffset;
 
 	uint8_t retries = is1050 ? MAX_RETRIES_1050 : MAX_RETRIES_810;
 
 	uint32_t retryOffset = currentFileOffset;
+	uint8_t writeStatus;
 	uint16_t extSectorSize;
+
+	uint32_t oneGermanATXOffset; // ;)
+
 
 	while (retries > 0)
 	{
 		retries--;
 		currentFileOffset = retryOffset;
-		int pTT;
+		int pTT = 0;
 		uint16_t tgtSectorIndex = 0;         // the index of the target sector within the sector list
 		tgtSectorOffset = 0;
+		writeStatusOffset = 0;
+		oneGermanATXOffset = 0;
 		weakOffset = -1;
+		writeStatus = MASK_FDC_MISSING;
 		// iterate through all sector headers to find the target sector
 
 		if(sectorCount)
 		{
 			for (int i = 0; i < sectorCount; i++)
 			{
-				if(!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, currentFileOffset, sizeof(atxSectorHeader)))
+				if (!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, currentFileOffset, sizeof(atxSectorHeader)))
 				{
 					r = -1;
 					break;
 				}
-				sectorHeader = (atxSectorHeader *)atari_sector_buffer;
+				sectorHeader = (atxSectorHeader *) half_buf_ptr;
+
+				if (op_type == ATX_FILE_ACCESS_WRITE && tgtTrackNumber == 38 && sectorHeader->number == 23 && tgtSectorNumber == 25 && sectorHeader->timev == 12066)
+				{
+					oneGermanATXOffset = sectorHeader->data;
+				}
 
 				// if the sector is not flagged as missing and its number matches the one we're looking for...
 				if (sectorHeader->number == tgtSectorNumber)
 				{
 					if(sectorHeader->status & MASK_FDC_MISSING)
 					{
+						writeStatus |= sectorHeader->status;
 						currentFileOffset += sizeof(atxSectorHeader);
 						continue;
 					}
@@ -1072,14 +1127,19 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 					{
 						pTT = tt;
 						*status = sectorHeader->status;
+						writeStatusOffset = currentFileOffset + 1;
 						tgtSectorIndex = i;
 						tgtSectorOffset = sectorHeader->data;
+						if (oneGermanATXOffset && tgtTrackNumber == 38 && tgtSectorNumber == 25 && sectorHeader->timev != 12355)
+						{
+							oneGermanATXOffset = 0;
+						}
 					}
 				}
 				currentFileOffset += sizeof(atxSectorHeader);
 			}
 		}
-	
+
 		uint16_t actSectorSize = atxSectorSize;
 		extSectorSize = 0;
 		// if an extended data record exists for this track, iterate through all track chunks to search
@@ -1093,7 +1153,7 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 					r = -1;
 					break;
 				}
-				extSectorData = (atxTrackChunk *) atari_sector_buffer;
+				extSectorData = (atxTrackChunk *) half_buf_ptr;
 				if (extSectorData->size)
 				{
 					// if the target sector has a weak data flag, grab the start weak offset within the sector data
@@ -1120,17 +1180,37 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 
 		if (tgtSectorOffset)
 		{
-			if(!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, atx_info[drv_num].trackOffset[tgtTrackNumber] + tgtSectorOffset, atxSectorSize))
+			if (!atx_file_access(drv_num, op_type, atx_info[drv_num].trackOffset[tgtTrackNumber] + tgtSectorOffset, atxSectorSize, 0))
 			{
 				r = -1;
 				tgtSectorOffset = 0;
+			}
+			else
+			{
+				if (oneGermanATXOffset && !atx_file_access(drv_num, ATX_FILE_ACCESS_WRITE, atx_info[drv_num].trackOffset[tgtTrackNumber] + oneGermanATXOffset + 36, atxSectorSize - 36, 0))
+				{
+					r = -1;
+					tgtSectorOffset = 0;
+				}
+				if (tgtSectorOffset && verify_op)
+				{
+					if (!atx_file_access(drv_num, ATX_FILE_ACCESS_READ, atx_info[drv_num].trackOffset[tgtTrackNumber] + tgtSectorOffset, atxSectorSize))
+					{
+						r = -1;
+						tgtSectorOffset = 0;
+					}
+					else if (memcmp(atari_sector_buffer, half_buf_ptr, atxSectorSize) || weakOffset > -1)
+					{
+						tgtSectorOffset = 0;
+					}
+				}
 			}
 
 			uint16_t au_one_sector_read = (23+actSectorSize)*(atx_info[drv_num].density == atx_single ? 8 : 4)+2;
 			// We will need to circulate around the disk one more time if we are re-reading the just written sector	    
 			wait_from_stamp((au_one_sector_read + pTT + (pTT > 0 ? 0 : AU_FULL_ROTATION))*8);
 
-			if(*status)
+			if (*status)
 			{		    
 				// This is according to Altirra, but it breaks DjayBee's test J in 1050 mode?!
 				// wait_us(is1050 ? (US_TRACK_STEP_1050+US_HEAD_SETTLE_1050) : (AU_FULL_ROTATION*8));
@@ -1142,14 +1222,14 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 		{
 			// No matching sector found at all or the track does not match the disk density
 			wait_from_stamp(is1050 ? US_2FAKE_ROT_1050 : US_3FAKE_ROT_810);
-			if(is1050 || retries == 2)
+			if (is1050 || retries == 2)
 			{
 				// Repositioning the head for the target track
-				if(!is1050)
+				if (!is1050)
 				{
 					wait_us((43+tgtTrackNumber)*US_TRACK_STEP_810+US_HEAD_SETTLE_810);
 				}
-				else if(tgtTrackNumber)
+				else if (tgtTrackNumber)
 				{
 					wait_us((2*tgtTrackNumber+1)*US_TRACK_STEP_1050+US_HEAD_SETTLE_1050);
 				}
@@ -1158,45 +1238,96 @@ static int loadAtxSector(int drv_num, uint16_t num, uint8_t *status)
 	
 		getCurrentHeadPosition();
 
-		if(!*status || r < 0) break;
+		if (!*status || r < 0) break;
 	}
 
 	*status &= ~(MASK_RESERVED | MASK_EXTENDED_DATA);
 
-	if (*status & MASK_FDC_DLOST)
+	if (op_type == ATX_FILE_ACCESS_WRITE)
 	{
-		if(is1050)
+		if (weakOffset == -1)
 		{
-			*status |= MASK_FDC_DRQ;
-		}
-		else
-		{
-			*status &= ~(MASK_FDC_DLOST | MASK_FDC_CRC);
-			*status |= MASK_FDC_BUSY;
+			if (tgtSectorOffset)
+			{
+				*status &= ~(MASK_FDC_CRC | MASK_FDC_REC);
+			}
+			else
+			{
+				*status = writeStatus & ~(MASK_RESERVED | MASK_EXTENDED_DATA);
+			}
 		}
 	}
-	if(!is1050 && (*status & MASK_FDC_REC)) *status |= MASK_FDC_WP;
+	else
+	{
+		if (*status & MASK_FDC_DLOST)
+		{
+			if(is1050)
+			{
+				*status |= MASK_FDC_DRQ;
+			}
+			else
+			{
+				*status &= ~(MASK_FDC_DLOST | MASK_FDC_CRC);
+				*status |= MASK_FDC_BUSY;
+			}
+		}
+		if(!is1050 && (*status & MASK_FDC_REC)) *status |= MASK_FDC_WP;
+	}
 
 	if (tgtSectorOffset && !*status && r >= 0) r = 0;
 
-	// if a weak offset is defined, randomize the appropriate data
-	if (weakOffset > -1)
+	if (op_type == ATX_FILE_ACCESS_READ)
 	{
-		for (int i = weakOffset; i < atxSectorSize; i++)
+		// if a weak offset is defined, randomize the appropriate data
+		if (weakOffset > -1) for (int i = weakOffset; i < atxSectorSize; i++) atari_sector_buffer[i] = rand();
+
+		wait_from_stamp(is1050 ? US_CS_CALC_1050 : US_CS_CALC_810);
+		// There is no file reading since last time stamp, so the alternative
+		// below is probably equally good
+		//wait_us(is1050 ? US_CS_CALC_1050 : US_CS_CALC_810);
+	}
+	else if (tgtSectorOffset && weakOffset == -1)
+	{
+		if (writeStatusOffset)
 		{
-			atari_sector_buffer[i] = rand();
+			half_buf_ptr[0] = *status;
+
+			if (!atx_file_access(drv_num, ATX_FILE_ACCESS_WRITE, writeStatusOffset, 1))
+			{
+				r = -1;
+				extSectorSize = 0;
+			}
+		}
+
+		if(extSectorSize > atxSectorSize)
+		{
+			extSectorSize = extSectorSize - atxSectorSize;
+		}
+		else
+		{
+			extSectorSize = 0;
+		}
+
+		if ((*status & MASK_FDC_DLOST) && extSectorSize)
+		{
+			memset(half_buf_ptr, 0xFF, 128);
+			currentFileOffset = atx_info[drv_num].trackOffset[tgtTrackNumber] + tgtSectorOffset + atxSectorSize;
+			while (extSectorSize)
+			{
+				if (!atx_file_access(drv_num, ATX_FILE_ACCESS_WRITE, currentFileOffset, 128))
+				{
+					r = -1;
+					break;
+				}
+				currentFileOffset += 128;
+				extSectorSize -= 128;
+			}
 		}
 	}
-
-	wait_from_stamp(is1050 ? US_CS_CALC_1050 : US_CS_CALC_810);
-	// There is no file reading since last time stamp, so the alternative
-	// below is probably equally good
-	//wait_us(is1050 ? US_CS_CALC_1050 : US_CS_CALC_810);
 
 	// the Atari expects an inverted FDC status byte
 	*status = ~(*status);
 
-	// return the number of bytes read
 	return r;
 }
 
@@ -1341,7 +1472,7 @@ static void set_drive_status(int drive_number, const char *name, uint8_t ext_ind
 		return;
 	}
 
-	uint8_t read_only = (ext_index == 1) || (ext_index == 3) ||
+	uint8_t read_only = (ext_index == 1) ||
 		!FileCanWrite(name) || (get_a8bit_reg(REG_ATARI_STATUS1) & STATUS1_MASK_RDONLY);
 
 
@@ -1628,43 +1759,49 @@ static void handle_write(sio_command_t command, int drive_number, fileTYPE *file
 	}
 	if (checksum == expchk)
 	{
+		int ok = 1;
+
 		if(!pbi)
 		{
 			wait_us(850);
 			uart_send('A');
 		}
 
-		FileSeek(file, location, SEEK_SET);
-		if(drive_infos[drive_number].info & INFO_SS)
+		if (drive_infos[drive_number].custom_loader == 2) // ATX
 		{
-			int step = 512 / drive_infos[drive_number].sector_size;
-			sector_size = ATARI_SECTOR_BUFFER_SIZE;
-			memset(atari_sector_buffer, 0, sector_size);
-			int i = 0;
-			int written = 0;
-			while(written < sector_size)
-			{
-				atari_sector_buffer[written] = action->sector_buffer[i++];
-				written += step;
-			}
-			FileWriteAdv(file, atari_sector_buffer, sector_size);
+			pre_ce_delay = 0; // Taken care of in transferAtxSector
+			ok = (0 == transferAtxSector(drive_number, sector, &drive_infos[drive_number].atari_sector_status, ATX_FILE_ACCESS_WRITE, command.command == 0x57));
+			action->bytes = drive_infos[drive_number].sector_size;
 		}
 		else
 		{
-			FileWriteAdv(file, atari_sector_buffer, sector_size);
-		}
-
-		int ok = 1;
-
-		if (command.command == 0x57)
-		{
 			FileSeek(file, location, SEEK_SET);
-			FileReadAdv(file, a8bit_buffer, sector_size);
-
-			for (int i = 0; i < sector_size; i++)
+			if(drive_infos[drive_number].info & INFO_SS)
 			{
-				if (a8bit_buffer[i] != action->sector_buffer[i]) ok = 0;
+				int step = 512 / drive_infos[drive_number].sector_size;
+				sector_size = 512;
+				memset(atari_sector_buffer, 0, sector_size);
+				int i = 0;
+				int written = 0;
+				while(written < sector_size)
+				{
+					atari_sector_buffer[written] = action->sector_buffer[i++];
+					written += step;
+				}
+				FileWriteAdv(file, atari_sector_buffer, sector_size);
 			}
+			else
+			{
+				FileWriteAdv(file, atari_sector_buffer, sector_size);
+			}
+
+			if (command.command == 0x57)
+			{
+				FileSeek(file, location, SEEK_SET);
+				FileReadAdv(file, a8bit_buffer, sector_size);
+				if (memcmp(a8bit_buffer, action->sector_buffer, sector_size)) ok = 0;
+			}
+
 		}
 
 		if(pbi)
@@ -1764,10 +1901,9 @@ set_number_of_sectors_to_buffer_1_2:
 	}
 	else if (drive_infos[drive_number].custom_loader == 2) // ATX
 	{
-		pre_ce_delay = 0; // Taken care of in loadAtxSector
-		int res = loadAtxSector(drive_number, sector, &drive_infos[drive_number].atari_sector_status);
+		pre_ce_delay = 0; // Taken care of in transferAtxSector
+		action->success = (0 == transferAtxSector(drive_number, sector, &drive_infos[drive_number].atari_sector_status));
 		action->bytes = drive_infos[drive_number].sector_size;
-		action->success = (res == 0);
 	}
 	else
 	{
@@ -1776,10 +1912,10 @@ set_number_of_sectors_to_buffer_1_2:
 		if(drive_infos[drive_number].info & INFO_SS)
 		{
 			uint8_t step = 512 / drive_infos[drive_number].sector_size;
-			FileReadAdv(file, atari_sector_buffer, ATARI_SECTOR_BUFFER_SIZE, -1);
+			FileReadAdv(file, atari_sector_buffer, 512, -1);
 			int read = 0;
 			int n = 0;
-			while(read < ATARI_SECTOR_BUFFER_SIZE)
+			while(read < 512)
 			{
 				action->sector_buffer[n++] = atari_sector_buffer[read];
 				read += step;
@@ -2210,10 +2346,10 @@ void atari800_set_image(int ext_index, int file_index, const char *name)
 		}
 		else if(file_index == 8)
 		{
-			set_a8bit_reg(REG_PAUSE, 1);
+			//set_a8bit_reg(REG_PAUSE, 1);
 			mounted_cart1_type = 0;
 			mounted_cart2_type = 0;
-			reboot(1, 0);
+			reboot_800(1, 0);
 			set_a8bit_reg(REG_OPTION_FORCE, 1);
 			set_a8bit_reg(REG_START_FORCE, 1);
 			set_a8bit_reg(REG_OPTION_FORCE, 0);
@@ -2229,7 +2365,7 @@ void atari800_set_image(int ext_index, int file_index, const char *name)
 			xex_file_first_block = 1;
 			mounted_cart1_type = 0;
 			mounted_cart2_type = 0;
-			reboot(1, 1);
+			reboot_800(1, 1);
 			set_a8bit_reg(REG_XEX_LOADER, 1);
 			uint16_t atari_status1 = get_a8bit_reg(REG_ATARI_STATUS1);
 
@@ -2271,7 +2407,7 @@ void atari800_set_image(int ext_index, int file_index, const char *name)
 	{
 		if(name[0])
 		{
-			set_a8bit_reg(REG_PAUSE, 1);
+			//set_a8bit_reg(REG_PAUSE, 1);
 			mounted_cart1_type = 0;
 			mounted_cart2_type = 0;
 			FileClose(&cas_file);
@@ -2281,7 +2417,7 @@ void atari800_set_image(int ext_index, int file_index, const char *name)
 		set_drive_status(0, name, ext_index);
 		if(name[0])
 		{
-			reboot(1, 0);
+			reboot_800(1, 0);
 			set_a8bit_reg(REG_OPTION_FORCE, 1);
 			set_a8bit_reg(REG_OPTION_FORCE, 0);
 		}
@@ -2499,9 +2635,72 @@ xex_eof:
 
 }
 
+static void check_flash()
+{
+	static uint8_t flash_dirty = 0;
+	static uint64_t flash_dirty_stamp = 0;
+
+	uint16_t r = get_a8bit_reg(REG_ATARI_FLASH);
+
+	if(r & 0x0001)
+	{
+		flash_dirty_stamp = get_us(2000000);
+		flash_dirty |= (r & 0x0002) ? 2 : 1;
+	}
+
+	// Explicit save request or autosave and timer expired
+	if(flash_dirty && ((r & 0x0008) || ((r & 0x0004) && flash_dirty_stamp <= get_us(0))))
+	{
+		uint8_t stacked = flash_dirty & 0x02;
+		fileTYPE *f = stacked ? &cart2_file : &cart1_file;
+
+		if(!(f->mode & O_RDONLY))
+		{
+			uint8_t report_progress = r & 0x0008;
+			uint8_t car_file_type = (f->size & 0x3FF) == 16;
+			uint32_t mem_offset = SDRAM_BASE + 0x800000;
+			uint32_t check_sum = 0;
+			int offset = car_file_type ? 16 : 0;
+			if(stacked) mem_offset += 0x100000;
+			if(f->size - offset == 0x82000 || f->size - offset == 0x102000)
+			{
+				// Corina carts, need only the last 8K (EEPROM) to be saved
+				mem_offset += 0x100000;
+				offset = f->size - 0x2000;
+			}
+			FileSeek(f, offset, SEEK_SET);
+			if(report_progress) ProgressMessage(0, 0, 0, 0);
+			while (offset < f->size)
+			{
+				int to_write = f->size - offset;
+				if (to_write > BUFFER_SIZE) to_write = BUFFER_SIZE;
+				if(report_progress) ProgressMessage("Saving", f->name, offset, f->size);
+				atari800_dma_read(a8bit_buffer, mem_offset, to_write);
+				FileWriteAdv(f, a8bit_buffer, to_write);
+				if(car_file_type) for(int i = 0; i < to_write; i++) check_sum += a8bit_buffer[i];
+				offset += to_write;
+				mem_offset += to_write;
+			}
+			if(car_file_type)
+			{
+				FileSeek(f, 8, SEEK_SET);
+				a8bit_buffer[0] = (check_sum >> 24);
+				a8bit_buffer[1] = (check_sum >> 16);
+				a8bit_buffer[2] = (check_sum >> 8);
+				a8bit_buffer[3] = check_sum;
+				FileWriteAdv(f, a8bit_buffer, 4);
+			}
+			if(report_progress) ProgressMessage(0, 0, 0, 0);
+			else Info("Cart image saved.", 2000);
+		}
+		flash_dirty = 0;
+	}
+}
+
 void atari800_poll()
 {
 	check_reset_pause();
+	check_flash();
 	
 	if(xex_file.opened()) handle_xex();
 	if(cas_file.opened()) handle_cas();
@@ -2546,9 +2745,11 @@ void atari800_reset()
 	}
 	FileClose(&xex_file);
 	FileClose(&cas_file);
+	FileClose(&cart1_file);
+	FileClose(&cart2_file);
 	set_a8bit_reg(TAPE_RESET, 1);
 	set_a8bit_reg(TAPE_RESET, 0);
 	speed_index = 0;
 	uart_init(speeds[speed_index] + 6);
-	reboot(1, 0);
+	reboot_800(1, 0);
 }
