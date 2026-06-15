@@ -6316,10 +6316,9 @@ void key_update_frames_held_cb(void)
 
 int input_poll(int getchar)
 {
-	#ifdef PROFILING
-		PROFILE_FUNCTION();
-	#endif
 
+	static int poll_cnt = 0;
+	PROFILE_FUNCTION();
 	static bool autofire_cfg_parsed = false;
  	if (!autofire_cfg_parsed) autofire_cfg_parsed = parse_autofire_cfg();
 	static uint32_t joy_mask_prev[NUMPLAYERS] = {};
