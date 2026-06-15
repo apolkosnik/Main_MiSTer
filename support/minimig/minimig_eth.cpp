@@ -13,6 +13,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <time.h>
+#include <stdint.h>
 
 #include "minimig_eth.h"
 
@@ -73,6 +75,18 @@ static struct host_rx_packet host_rx_queue[ETH_HOST_RX_QUEUE_DEPTH];
 static uint8_t host_rx_queue_head = 0;
 static uint8_t host_rx_queue_tail = 0;
 static uint8_t host_rx_queue_count = 0;
+
+// ---------------------------------------------------------------------------
+// Lightweight throughput instrumentation to find the real HW bottleneck.
+// Counts are free; one summary line is emitted ~once per second. The defer/drop
+// counters are the key signal: they only grow when the FPGA RX queue is full,
+// i.e. the Amiga (data-port PIO + FPGA bg) cannot drain as fast as the host
+// delivers -> the bottleneck is the Amiga/FPGA side, not this daemon.
+// ---------------------------------------------------------------------------
+static uint64_t g_perf_rx_frames = 0, g_perf_rx_bytes = 0;
+static uint64_t g_perf_rx_defer  = 0, g_perf_rx_drop  = 0;
+static uint64_t g_perf_tx_frames = 0, g_perf_tx_bytes = 0;
+static uint64_t g_perf_polls     = 0;
 
 // Access ethernet shared memory through mapped region
 static void eth_write_shared_mem(uint32_t offset, const void *data, uint32_t size)
@@ -244,28 +258,28 @@ static void eth_update_shared_status(uint16_t clear_mask, uint16_t set_mask)
 
 static uint8_t read_ne_register(uint8_t page, uint8_t reg);
 
-//static bool translate_ne_packet_addr(uint16_t addr, uint32_t* shared_offset)
-//{
-//    if (addr >= NE_PMEM_START && addr < NE_PMEM_END) {
-//        *shared_offset = ETH_NE_MEMORY + (uint32_t)(addr - NE_PMEM_START);
-//        return true;
-//    }
+static bool translate_ne_packet_addr(uint16_t addr, uint32_t* shared_offset)
+{
+    if (addr >= NE_PMEM_START && addr < NE_PMEM_END) {
+        *shared_offset = ETH_NE_MEMORY + (uint32_t)(addr - NE_PMEM_START);
+        return true;
+    }
 
-//    return false;
-//}
+    return false;
+}
 
-//static uint8_t synthetic_prom_byte(uint16_t addr)
-//{
-//    uint8_t mac_addr[6];
-//    uint8_t prom[16] = {0};
+static uint8_t synthetic_prom_byte(uint16_t addr)
+{
+    uint8_t mac_addr[6];
+    uint8_t prom[16] = {0};
 
-//    eth_read_shared_mem(ETH_CTRL_MAC, mac_addr, sizeof(mac_addr));
-//    memcpy(prom, mac_addr, 6);
-//    prom[14] = 0x57;
-//    prom[15] = 0x57;
+    eth_read_shared_mem(ETH_CTRL_MAC, mac_addr, sizeof(mac_addr));
+    memcpy(prom, mac_addr, 6);
+    prom[14] = 0x57;
+    prom[15] = 0x57;
 
-//    return prom[(addr >> 1) & 0x0F];
-//}
+    return prom[(addr >> 1) & 0x0F];
+}
 
 static uint32_t ethernet_crc32_le(const uint8_t* data, size_t len)
 {
@@ -299,24 +313,24 @@ static bool multicast_hash_match(const uint8_t dest_mac[6])
     return (mar[hash >> 3] & (1u << (hash & 7))) != 0;
 }
 
-//// Helper functions to access NE2000 memory directly from shared memory
-//static uint8_t read_ne_memory(uint16_t addr)
-//{
-//    uint32_t shared_offset;
+// Helper functions to access NE2000 memory directly from shared memory
+static uint8_t read_ne_memory(uint16_t addr)
+{
+    uint32_t shared_offset;
 
-//    if (addr < NE_PROM_SIZE) {
-//        return synthetic_prom_byte(addr);
-//    }
+    if (addr < NE_PROM_SIZE) {
+        return synthetic_prom_byte(addr);
+    }
 
-//    if (!translate_ne_packet_addr(addr, &shared_offset)) {
-//        eth_debug("NE2000 memory read from unmapped addr=0x%04X\n", addr);
-//        return 0xFF;
-//    }
+    if (!translate_ne_packet_addr(addr, &shared_offset)) {
+        eth_debug("NE2000 memory read from unmapped addr=0x%04X\n", addr);
+        return 0xFF;
+    }
 
-//    uint8_t value;
-//    eth_read_shared_mem(shared_offset, &value, 1);
-//    return value;
-//}
+    uint8_t value;
+    eth_read_shared_mem(shared_offset, &value, 1);
+    return value;
+}
 
 // Helper functions to access NE2000 registers directly from shared memory
 static uint8_t read_ne_register(uint8_t page, uint8_t reg)
@@ -454,6 +468,8 @@ static bool enqueue_shared_rx_packet(const uint8_t* data, uint16_t len, uint32_t
     eth_write_shared_u16(shared_rx_slot_len_offset(tail), len);
     write_shared_rx_queue_tail(next_tail);
     *flags = eth_update_shared_flags(0, ETH_FLAG_RX_AVAIL);
+    g_perf_rx_frames++;
+    g_perf_rx_bytes += len;
 
     eth_debug("ETH: Enqueued shared RX packet slot=%u len=%u head=%u tail->%u\n",
               tail, len, head, next_tail);
@@ -842,9 +858,11 @@ void receive_packet()
 
         if (enqueue_shared_rx_packet(buffer, packet_len, &flags, &state)) {
         } else if (!enqueue_host_rx_packet(buffer, packet_len)) {
+            g_perf_rx_drop++;
             eth_debug("ETH: RX software queue full, dropping packet of %u bytes\n", packet_len);
             state.rx_errors++;
         } else {
+            g_perf_rx_defer++;
             eth_debug("ETH: Deferred RX packet of %u bytes in host queue (depth: %u)\n",
                       packet_len, host_rx_queue_count);
         }
@@ -881,6 +899,36 @@ void minimig_eth_poll()
         eth_write_shared_u32(ETH_HPS_HEARTBEAT, hps_heartbeat_counter);
         eth_write_shared_u32(ETH_HPS_SIGNATURE, ETH_HPS_SIGNATURE_MAGIC);
         eth_update_shared_status(ETH_STATUS_LINK_UP, 0);
+
+        // --- throughput measurement: one summary line per second ---
+        g_perf_polls++;
+        {
+            static struct timespec perf_last = {0, 0};
+            struct timespec perf_now;
+            clock_gettime(CLOCK_MONOTONIC, &perf_now);
+            if (perf_last.tv_sec == 0 && perf_last.tv_nsec == 0) perf_last = perf_now;
+            double perf_dt = (perf_now.tv_sec - perf_last.tv_sec) +
+                             (perf_now.tv_nsec - perf_last.tv_nsec) / 1e9;
+            if (perf_dt >= 1.0) {
+                static uint64_t p_rxf = 0, p_rxb = 0, p_txf = 0, p_txb = 0;
+                static uint64_t p_pl = 0, p_df = 0, p_dr = 0;
+                double rxf = (g_perf_rx_frames - p_rxf) / perf_dt;
+                double rxk = (g_perf_rx_bytes  - p_rxb) / perf_dt / 1024.0;
+                double txf = (g_perf_tx_frames - p_txf) / perf_dt;
+                double txk = (g_perf_tx_bytes  - p_txb) / perf_dt / 1024.0;
+                double pls = (g_perf_polls     - p_pl)  / perf_dt;
+                eth_debug("ETHPERF: RX %.0f fps %.1f KB/s | TX %.0f fps %.1f KB/s | "
+                          "defer %llu drop %llu hostQ %u | poll %.0f/s\n",
+                          rxf, rxk, txf, txk,
+                          (unsigned long long)(g_perf_rx_defer - p_df),
+                          (unsigned long long)(g_perf_rx_drop  - p_dr),
+                          (unsigned)host_rx_queue_count, pls);
+                p_rxf = g_perf_rx_frames; p_rxb = g_perf_rx_bytes;
+                p_txf = g_perf_tx_frames; p_txb = g_perf_tx_bytes;
+                p_pl  = g_perf_polls; p_df = g_perf_rx_defer; p_dr = g_perf_rx_drop;
+                perf_last = perf_now;
+            }
+        }
         
         // Reduced monitoring: only log when a new TX mailbox request appears.
         static uint16_t last_tx_request_seq = 0;
@@ -928,6 +976,7 @@ void minimig_eth_poll()
             if ((request.seq != 0) && (request.seq != hps_last_tx_complete_seq)) {
                 eth_update_shared_status(ETH_STATUS_TX_OK | ETH_STATUS_TX_ERR, 0);
                 bool tx_ok = transmit_packet(&request);
+                if (tx_ok) { g_perf_tx_frames++; g_perf_tx_bytes += request.len; }
                 eth_write_shared_u16(ETH_TX_COMPLETE_SEQ, request.seq);
                 hps_last_tx_complete_seq = request.seq;
                 eth_update_shared_status(ETH_STATUS_TX_OK | ETH_STATUS_TX_ERR,
