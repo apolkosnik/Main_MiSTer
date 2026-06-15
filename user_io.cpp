@@ -51,6 +51,7 @@ static fileTYPE sd_image[16] = {};
 #define  SD_TYPE_A2 2
 
 static int      sd_type[16] = {};
+static unsigned char last_file_ext_idx = 0;
 static int      sd_image_cangrow[16] = {};
 static uint64_t buffer_lba[16] = { ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,
 								   ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,ULLONG_MAX,
@@ -2010,6 +2011,7 @@ int process_ss(const char *rom_name, int enable)
 
 void user_io_set_index(unsigned char index)
 {
+	last_file_ext_idx = index >> 6;
 	EnableFpga();
 	spi8(FIO_FILE_INDEX);
 	spi8(index);
@@ -2119,6 +2121,18 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				writable = FileCanWrite(name);
 				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
 				if (ret && len > 4) {
+					const char *core_name = user_io_get_core_name();
+					const char *orig_core_name = user_io_get_core_name(1);
+					const unsigned char ext_idx = last_file_ext_idx;
+					const bool a2_core = !strcasecmp(core_name, "apple-ii") || !strcasecmp(core_name, "TK2000");
+					const bool oric_core =
+						!strcasecmp(core_name, "Oric") ||
+						!strcasecmp(core_name, "Pravetz 8D") ||
+						!strcasecmp(orig_core_name, "Oric") ||
+						!strcasecmp(orig_core_name, "Pravetz 8D");
+					const bool oric_a2_slot = oric_core && index < 2 && (ext_idx == 1 || ext_idx == 2);
+					const bool dsk_ext = !strcasecmp(name + len - 4, ".dsk");
+					const bool do_ext = len > 3 && !strcasecmp(name + len - 3, ".do");
 					if (!strcasecmp(name + len - 4, ".d64")
 						|| !strcasecmp(name + len - 4, ".g64")
 						|| !strcasecmp(name + len - 4, ".d71")
@@ -2133,10 +2147,27 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 					{
 						img_type = G64_SUPPORT_HD | G64_SUPPORT_DS;
 					}
-					else if (!strcasecmp(name + len - 4, ".dsk") && ((!strcasecmp(user_io_get_core_name(), "apple-ii") || (!strcasecmp(user_io_get_core_name(), "TK2000") )) ))
+					else if ((dsk_ext && (a2_core || oric_a2_slot)) || (do_ext && oric_a2_slot))
 					{
-						printf("FOUND A2 DSK type\n");
+						printf("FOUND A2 DSK/DO type\n");
 						sd_type[index] = SD_TYPE_A2;
+					}
+				}
+
+				// Apple IIgs: classify/validate/convert the image for its slot.
+				if (ret && iigs_is_core())
+				{
+					int iigs_w = writable;
+					int r = iigs_mount(index, name, &sd_image[index], &iigs_w);
+					if (r == IIGS_REJECT)
+					{
+						FileClose(&sd_image[index]);
+						ret = 0;
+					}
+					else if (r == IIGS_HANDLED)
+					{
+						sd_type[index] = SD_TYPE_IIGS;
+						writable = iigs_w;
 					}
 				}
 
@@ -3248,6 +3279,12 @@ void user_io_poll()
 				else if (op & 1) a2_readDSK(&sd_image[disk], lba, ack);
 				else break;
 			}
+			else if ( sd_type[disk] == SD_TYPE_IIGS)
+			{
+				if (op == 2) iigs_write(disk, &sd_image[disk], lba, ack);
+				else if (op & 1) iigs_read(disk, &sd_image[disk], lba, ack);
+				else break;
+			}
 			else if ((blks == G64_BLOCK_COUNT_1541+1 || blks == G64_BLOCK_COUNT_1571+1) && sd_type[disk]==SD_TYPE_C64)
 			{
 				if (op == 2) c64_writeGCR(disk, lba, blks-1);
@@ -3340,7 +3377,7 @@ void user_io_poll()
 						done = 1;
 						buffer_lba[disk] = lba;
 					}
-					else if (blksz == (2352 + 24) && is_cdi())
+					else if (blksz == CDI_CDIC_BUFFER_SIZE && is_cdi())
 					{
 						diskled_on();
 						cdi_read_cd(buffer[disk], lba, buf_n);
@@ -3428,7 +3465,7 @@ void user_io_poll()
 						psx_read_cd(buffer[disk], lba, buf_n);
 						buffer_lba[disk] = lba;
 					}
-					else if (blksz == (2352 + 24) && is_cdi())
+					else if (blksz == CDI_CDIC_BUFFER_SIZE && is_cdi())
 					{
 						cdi_read_cd(buffer[disk], lba, buf_n);
 						buffer_lba[disk] = lba;
