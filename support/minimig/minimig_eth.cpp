@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <linux/filter.h>
 #include <ifaddrs.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -31,13 +32,51 @@
 #endif
 
 
-#define ETH_DEBUG
+//#define ETH_DEBUG
 
 #ifdef ETH_DEBUG
     #define eth_debug printf
 #else
     #define eth_debug(x,...) void()
 #endif
+
+// Per-frame trace (the "Enqueued"/"RX Data"/"Transmitting" hex dumps). This runs
+// once or several times PER PACKET, so under load it is pure overhead (and on a
+// slow console it throttles the very path we are trying to speed up). Leave it
+// OFF by default; define ETH_TRACE to restore the verbose per-frame logging.
+//#define ETH_TRACE
+#ifdef ETH_TRACE
+    #define eth_trace printf
+#else
+    #define eth_trace(x,...) void()
+#endif
+
+// Performance summary line. INDEPENDENT of ETH_DEBUG so the once-per-second
+// ETHPERF line prints even in a quiet production build (where ETH_DEBUG is off).
+// Comment out to silence.
+#define ETH_PERF
+#ifdef ETH_PERF
+    #define eth_perf printf
+#else
+    #define eth_perf(x,...) void()
+#endif
+
+// RX broadcast denoise: a busy LAN floods the Amiga with broadcast traffic
+// (SSDP/mDNS/LLMNR/discovery), and every frame interrupts the 68020 and runs
+// the TCP/IP stack just to discard it -- stealing CPU from real transfers.
+// With this on, broadcast frames are forwarded only when they are actually
+// useful to the Amiga (ARP, DHCP/BOOTP, NetBIOS name/datagram, and broadcast
+// non-UDP IP); other broadcast floods are dropped on the HPS side. Unicast and
+// multicast are unaffected. Comment this out to forward all broadcast as before.
+#define ETH_RX_BROADCAST_DENOISE
+
+// RX kernel filter (H4): attach a cBPF program to the raw socket so the kernel
+// drops frames the Amiga can't use BEFORE they reach userspace, instead of
+// recv()-ing the whole promiscuous LAN and filtering in the daemon. Passes
+// unicast to the Amiga's station MAC plus broadcast/multicast (group bit);
+// detached automatically while the Amiga driver is promiscuous (RCR.PRO).
+// Comment out to recv() everything as before.
+#define ETH_RX_KERNEL_FILTER
 
 
 #ifdef ETH_DEBUG
@@ -64,7 +103,7 @@ static uint16_t hps_last_tx_complete_seq = 0;
 static struct sockaddr_ll sock_addr;
 static char bridge_interface[16] = "eth0";
 
-#define ETH_HOST_RX_QUEUE_DEPTH 8
+#define ETH_HOST_RX_QUEUE_DEPTH 32   // deeper host-side spill queue for RX bursts
 
 struct host_rx_packet {
     uint16_t len;
@@ -87,6 +126,51 @@ static uint64_t g_perf_rx_frames = 0, g_perf_rx_bytes = 0;
 static uint64_t g_perf_rx_defer  = 0, g_perf_rx_drop  = 0;
 static uint64_t g_perf_tx_frames = 0, g_perf_tx_bytes = 0;
 static uint64_t g_perf_polls     = 0;
+static uint64_t g_perf_bcast_drop = 0;   // broadcast frames denoised (not forwarded)
+// Amiga's advertised TCP receive window, observed on its outgoing ACKs. This is
+// the download throughput cap (throughput ~= rwnd / RTT); g_perf_tx_win_min is
+// reset each ETHPERF interval, g_perf_tx_zerowin counts zero-window stalls.
+static uint32_t g_perf_tx_win_min  = 0xFFFFFFFF;
+static uint32_t g_perf_tx_win_last = 0;
+static uint64_t g_perf_tx_zerowin  = 0;
+// TX frames the FPGA staged (TX_REQUEST_SEQ bumped) that the daemon never got to
+// send because the single shared TX buffer was overwritten before it drained it.
+// A download's ACK storm is the suspected trigger; lost ACKs -> server RTO/abort.
+static uint64_t g_perf_tx_miss     = 0;
+// Download loss signal: the daemon sniffs the wire, so it sees the SERVER's TCP
+// segments to the Amiga. When the server RE-sends data already past the flow's
+// high-water mark, the server believes a segment was lost -> that is REAL RX
+// loss wherever it happened (kernel, HPS->FPGA hand-off, or the Amiga). This is
+// the one signal sockDrop/ovwDrop/defer/drop cannot show: a delivered-but-
+// corrupt frame is dropped by the Amiga's TCP (bad checksum) without tripping
+// any drop counter, yet the server still retransmits. retx>0 during a download
+// == frames are being lost; retx==0 with low KB/s == pure window/RTT dynamics.
+static uint64_t g_perf_rx_retx     = 0;
+// Splits the cause of retx: counts the Amiga's OUTGOING duplicate ACKs (same ack
+// number repeated on a flow). A dup-ACK means the Amiga's TCP received an
+// out-of-order segment with a hole, i.e. a segment was LOST on the way IN -- so
+// dupAck>0 alongside retx == the FPGA/daemon delivery is still dropping/corrupting
+// a segment (data loss). retx>0 with dupAck~0 == the Amiga's ACKs aren't reaching
+// the server (ACK loss) or pure RTO. This tells us which half of the path to fix.
+static uint64_t g_perf_dup_ack     = 0;
+// Forward seq holes the DAEMON itself sees on the inbound stream: a segment
+// arrived ahead of the expected next byte, so the bytes between were never
+// recv()'d. With sockDrop=0 that means they were lost UPSTREAM of us (wire /
+// switch / sender) -- it EXONERATES the FPGA path. rxGap~0 while dupAck>0 means
+// the daemon got everything but the Amiga didn't => loss is in OUR delivery.
+static uint64_t g_perf_rx_gap      = 0;
+// Daemon send() failures: the Amiga's outgoing frame (often an ACK) never left
+// the HPS. txDrop>0 with retx>0 and dupAck~0 == ACKs lost on egress, not on RX.
+static uint64_t g_perf_tx_drop     = 0;
+// Integrity probe: the FPGA bg publishes a running 16-bit byte-sum of every RX
+// payload byte it writes into the ring (sync slot 40, shm 0x110A, byte-swapped).
+// We keep the same running sum of frame bytes handed to the shm queue. At
+// quiescence (shm RX queue + host queue both empty) the bg has delivered exactly
+// what we enqueued, so the two sums differ by a CONSTANT offset (reset skew). If
+// that offset CHANGES between quiescent samples, a frame was corrupted in shm->bg
+// (mailbox/CDC) -- delivBad counts those events.
+static uint64_t g_perf_deliv_bad   = 0;
+static uint32_t g_sent_csum_run    = 0;   // daemon running byte-sum (16-bit)
 
 // Access ethernet shared memory through mapped region
 static void eth_write_shared_mem(uint32_t offset, const void *data, uint32_t size)
@@ -120,6 +204,37 @@ static void eth_read_shared_mem(uint32_t offset, void *data, uint32_t size)
     
     //eth_debug("ETH: Reading %d bytes from offset 0x%X\n", size, offset);
     memcpy(data, eth_shmem + offset, size);
+}
+
+static void eth_shared_readback_fence(uint32_t offset)
+{
+    if (!eth_shmem || eth_shmem == (uint8_t *)-1 || offset >= ETH_SHMEM_SIZE) {
+        return;
+    }
+
+    volatile uint8_t *shared = (volatile uint8_t *)eth_shmem;
+    volatile uint8_t sink = shared[offset];
+    (void)sink;
+    __sync_synchronize();
+}
+
+static void eth_write_shared_rx_payload(uint32_t offset, const uint8_t *data, uint32_t size)
+{
+    if (!eth_shmem || eth_shmem == (uint8_t *)-1) {
+        eth_debug("eth_write_shared_rx_payload: no eth_shmem!\n");
+        return;
+    }
+    if (offset + size > ETH_SHMEM_SIZE) {
+        eth_debug("ETH: RX payload write beyond shared memory bounds: offset=0x%X, size=%d\n",
+                  offset, size);
+        return;
+    }
+
+    volatile uint8_t *dst = (volatile uint8_t *)eth_shmem + offset;
+    for (uint32_t i = 0; i < size; i++) {
+        dst[i] = data[i];
+    }
+    __sync_synchronize();
 }
 
 static void eth_write_shared_u32(uint32_t offset, uint32_t value)
@@ -313,6 +428,212 @@ static bool multicast_hash_match(const uint8_t dest_mac[6])
     return (mar[hash >> 3] & (1u << (hash & 7))) != 0;
 }
 
+// Decide whether a broadcast frame is worth forwarding to the Amiga. Keeps the
+// control/discovery traffic the Amiga TCP/IP stack actually needs (ARP, DHCP,
+// NetBIOS) and broadcast non-UDP IP; drops the rest (SSDP/mDNS/LLMNR/large
+// discovery floods) so they never burn 68020 cycles. data[] is the raw frame.
+static bool broadcast_is_essential(const uint8_t* data, uint16_t len)
+{
+    if (len < 14) return false;
+    uint16_t eth_type = (uint16_t)((data[12] << 8) | data[13]);
+
+    if (eth_type == 0x0806) return true;    // ARP - always needed
+    if (eth_type != 0x0800) return false;   // non-IP broadcast -> junk
+
+    if (len < 14 + 20) return true;         // too short to parse -> keep (safe)
+    uint8_t ihl = (uint8_t)((data[14] & 0x0F) * 4);
+    if (ihl < 20) ihl = 20;
+    uint8_t proto = data[23];
+    if (proto != 17) return true;           // broadcast non-UDP IP (rare) -> keep
+
+    uint32_t udp_off = (uint32_t)(14 + ihl);
+    if ((uint32_t)len < udp_off + 4) return true;   // can't read ports -> keep
+    uint16_t dport = (uint16_t)((data[udp_off + 2] << 8) | data[udp_off + 3]);
+
+    // Essential broadcast UDP services the Amiga may rely on.
+    if (dport == 67 || dport == 68)   return true;   // DHCP / BOOTP
+    if (dport == 137 || dport == 138) return true;   // NetBIOS name / datagram
+
+    return false;   // SSDP(1900)/mDNS(5353)/LLMNR(5355)/WS-Discovery/floods -> drop
+}
+
+// Extract the TCP advertised receive window from an Amiga-outgoing frame, or -1
+// if it is not IPv4/TCP. NOTE: this is the raw 16-bit window field; if the stack
+// negotiated window scaling the effective window is larger, but retro stacks
+// usually don't, so this is the real receive window in practice.
+static int tcp_adv_window(const uint8_t* d, uint16_t len)
+{
+    if (len < 14 + 20 + 20) return -1;
+    if (((d[12] << 8) | d[13]) != 0x0800) return -1;     // not IPv4
+    uint8_t ihl = (uint8_t)((d[14] & 0x0F) * 4);
+    if (ihl < 20) return -1;
+    if (d[23] != 6) return -1;                            // not TCP
+    uint32_t tcp = (uint32_t)(14 + ihl);
+    if ((uint32_t)len < tcp + 16) return -1;
+    return (d[tcp + 14] << 8) | d[tcp + 15];              // TCP window field
+}
+
+// Track inbound (server->Amiga) TCP data segments and count retransmissions of
+// data we have already seen. A server only resends bytes it believes were lost,
+// so a non-zero rate is a direct, ground-truth measurement of RX loss -- the
+// thing the drop counters miss when a frame is delivered but corrupt. Tiny
+// fixed flow table; signed sequence diff handles 32-bit wrap. A seq ahead of the
+// high-water mark just advances it (could be a segment the sniffer missed, not a
+// server loss), so only seq BEHIND the mark is counted as a retransmit.
+#define ETH_RETX_FLOWS 16
+static struct { uint8_t valid; uint32_t key; uint32_t next_seq; } g_retx_flow[ETH_RETX_FLOWS];
+
+// Retransmit CLASSIFIER -- resolves the retx contradiction. A direction-
+// INDEPENDENT connection key ties the server->Amiga data flow to the Amiga->
+// server ACK flow in one entry: in_seq_hi = highest server data byte seen,
+// out_ack_hi = highest ack number the Amiga sent. On a server retransmit (seq
+// behind in_seq_hi): if seq < out_ack_hi the Amiga ALREADY ACKed it -> the
+// server never got that ACK (ACK-LOSS, retxAck); else the Amiga has NOT ACKed it
+// (DATA-LOSS, retxDat). This says directly whether to chase the ACK path or the
+// ring->Amiga delivery.
+static uint64_t g_perf_retx_ack = 0;   // server resent already-ACKed data -> ACK-loss
+static uint64_t g_perf_retx_dat = 0;   // server resent not-yet-ACKed data -> data-loss
+#define ETH_CONN_FLOWS 16
+static struct {
+    uint8_t  valid, have_in, have_ack;
+    uint32_t key, in_seq_hi, out_ack_hi;
+} g_conn[ETH_CONN_FLOWS];
+
+static inline uint32_t eth_conn_key(uint32_t a1, uint32_t a2, uint16_t p1, uint16_t p2)
+{
+    uint32_t k = (a1 ^ a2) ^ ((uint32_t)(p1 ^ p2) * 2654435761u);  // commutative -> same both directions
+    return k ? k : 1;
+}
+
+static void tcp_track_download(const uint8_t* d, uint16_t len)
+{
+    if (len < 14 + 20) return;
+    if (((d[12] << 8) | d[13]) != 0x0800) return;        // IPv4 only
+    const uint8_t* ip = d + 14;
+    if ((ip[0] >> 4) != 4) return;
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4);
+    if (ihl < 20 || ip[9] != 6) return;                  // TCP only
+    if ((uint32_t)14 + ihl + 20 > len) return;
+    uint16_t tot = (uint16_t)((ip[2] << 8) | ip[3]);
+    const uint8_t* tcp = ip + ihl;
+    uint16_t thl = (uint16_t)(((tcp[12] >> 4) & 0x0F) * 4);
+    if (thl < 20 || (uint32_t)ihl + thl > tot) return;
+    uint32_t payload = (uint32_t)tot - ihl - thl;
+    if (payload == 0) return;                            // pure ACK -> not data
+    uint32_t seq   = ((uint32_t)tcp[4] << 24) | ((uint32_t)tcp[5] << 16) |
+                     ((uint32_t)tcp[6] << 8)  |  (uint32_t)tcp[7];
+    uint32_t saddr = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                     ((uint32_t)ip[14] << 8)  |  (uint32_t)ip[15];
+    uint32_t daddr = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
+                     ((uint32_t)ip[18] << 8)  |  (uint32_t)ip[19];
+    uint16_t sport = (uint16_t)((tcp[0] << 8) | tcp[1]);
+    uint16_t dport = (uint16_t)((tcp[2] << 8) | tcp[3]);
+    uint32_t key   = saddr ^ (daddr * 2654435761u) ^ (((uint32_t)sport << 16) | dport);
+    if (key == 0) key = 1;
+    unsigned slot = key % ETH_RETX_FLOWS;
+    if (!g_retx_flow[slot].valid || g_retx_flow[slot].key != key) {
+        g_retx_flow[slot].valid    = 1;
+        g_retx_flow[slot].key      = key;
+        g_retx_flow[slot].next_seq = seq + payload;
+        return;
+    }
+    int32_t diff = (int32_t)(seq - g_retx_flow[slot].next_seq);
+    if (diff < 0) {
+        g_perf_rx_retx++;                                // server resent old data
+    } else {
+        if (diff > 0) g_perf_rx_gap++;                   // hole in OUR inbound view -> lost upstream
+        g_retx_flow[slot].next_seq = seq + payload;      // new data, advance mark
+    }
+
+    // Classify the retransmit against what the Amiga has ACKed (shared conn table).
+    {
+        uint32_t ck = eth_conn_key(saddr, daddr, sport, dport);
+        unsigned cs = ck % ETH_CONN_FLOWS;
+        if (!g_conn[cs].valid || g_conn[cs].key != ck) {
+            g_conn[cs].valid = 1; g_conn[cs].key = ck;
+            g_conn[cs].in_seq_hi = seq + payload; g_conn[cs].have_in = 1;
+            g_conn[cs].have_ack = 0; g_conn[cs].out_ack_hi = 0;
+        } else if ((int32_t)(seq - g_conn[cs].in_seq_hi) < 0) {   // retransmit
+            if (g_conn[cs].have_ack && (int32_t)(seq - g_conn[cs].out_ack_hi) < 0)
+                g_perf_retx_ack++;                       // Amiga already ACKed it -> ACK-loss
+            else
+                g_perf_retx_dat++;                       // Amiga hadn't ACKed it -> data-loss
+        } else {
+            g_conn[cs].in_seq_hi = seq + payload;
+            g_conn[cs].have_in = 1;
+        }
+    }
+}
+
+// Count the Amiga's OUTGOING TRUE duplicate ACKs (see g_perf_dup_ack). A real
+// RFC-5681 dup-ACK carries NO data, repeats the same ack number, AND advertises
+// the SAME window -- that excludes window-update ACKs (same ack, growing window)
+// which would otherwise inflate the count during a healthy download. A true
+// dup-ACK means the Amiga received an OUT-OF-ORDER segment (a hole), i.e. our
+// delivery dropped or reordered an in-bound segment.
+static struct { uint8_t valid; uint32_t key; uint32_t last_ack; uint16_t last_win; } g_dack_flow[ETH_RETX_FLOWS];
+
+static void tcp_track_outgoing_ack(const uint8_t* d, uint16_t len)
+{
+    if (len < 14 + 20) return;
+    if (((d[12] << 8) | d[13]) != 0x0800) return;        // IPv4 only
+    const uint8_t* ip = d + 14;
+    if ((ip[0] >> 4) != 4) return;
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4);
+    if (ihl < 20 || ip[9] != 6) return;                  // TCP only
+    if ((uint32_t)14 + ihl + 20 > len) return;
+    uint16_t tot = (uint16_t)((ip[2] << 8) | ip[3]);
+    const uint8_t* tcp = ip + ihl;
+    if (!(tcp[13] & 0x10)) return;                       // ACK flag not set
+    uint16_t thl = (uint16_t)(((tcp[12] >> 4) & 0x0F) * 4);
+    if (thl < 20 || (uint32_t)ihl + thl > tot) return;
+    uint32_t payload = (uint32_t)tot - ihl - thl;        // data this ACK carries
+    uint32_t ack   = ((uint32_t)tcp[8] << 24) | ((uint32_t)tcp[9] << 16) |
+                     ((uint32_t)tcp[10] << 8) |  (uint32_t)tcp[11];
+    uint16_t win   = (uint16_t)((tcp[14] << 8) | tcp[15]);
+    uint32_t saddr = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                     ((uint32_t)ip[14] << 8)  |  (uint32_t)ip[15];
+    uint32_t daddr = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
+                     ((uint32_t)ip[18] << 8)  |  (uint32_t)ip[19];
+    uint16_t sport = (uint16_t)((tcp[0] << 8) | tcp[1]);
+    uint16_t dport = (uint16_t)((tcp[2] << 8) | tcp[3]);
+    // Retransmit classifier: record the highest ack the Amiga has sent for this
+    // connection (shared, direction-independent conn table; see tcp_track_download).
+    {
+        uint32_t ck = eth_conn_key(saddr, daddr, sport, dport);
+        unsigned cs = ck % ETH_CONN_FLOWS;
+        if (!g_conn[cs].valid || g_conn[cs].key != ck) {
+            g_conn[cs].valid = 1; g_conn[cs].key = ck;
+            g_conn[cs].out_ack_hi = ack; g_conn[cs].have_ack = 1;
+            g_conn[cs].have_in = 0; g_conn[cs].in_seq_hi = 0;
+        } else {
+            if (!g_conn[cs].have_ack || (int32_t)(ack - g_conn[cs].out_ack_hi) > 0)
+                g_conn[cs].out_ack_hi = ack;
+            g_conn[cs].have_ack = 1;
+        }
+    }
+    uint32_t key   = saddr ^ (daddr * 2654435761u) ^ (((uint32_t)sport << 16) | dport);
+    if (key == 0) key = 1;
+    unsigned slot = key % ETH_RETX_FLOWS;
+    if (!g_dack_flow[slot].valid || g_dack_flow[slot].key != key) {
+        g_dack_flow[slot].valid    = 1;
+        g_dack_flow[slot].key      = key;
+        g_dack_flow[slot].last_ack = ack;
+        g_dack_flow[slot].last_win = win;
+        return;
+    }
+    // True dup-ACK: same ack, no data, and the window did NOT grow. Requiring
+    // win<=last (not ==) is the fix for the bulk phase: a real dup-ACK is
+    // triggered by an out-of-order segment that just consumed buffer, so its
+    // window is the SAME or SMALLER; only a genuine window-UPDATE grows it. The
+    // earlier "win==last" missed dup-ACKs whose window shrank, hiding bulk-phase
+    // data loss behind dupAck=0.
+    if (payload == 0 && ack == g_dack_flow[slot].last_ack && win <= g_dack_flow[slot].last_win)
+        g_perf_dup_ack++;
+    g_dack_flow[slot].last_ack = ack;
+    g_dack_flow[slot].last_win = win;
+}
+
 // Helper functions to access NE2000 memory directly from shared memory
 static uint8_t read_ne_memory(uint16_t addr)
 {
@@ -464,14 +785,36 @@ static bool enqueue_shared_rx_packet(const uint8_t* data, uint16_t len, uint32_t
         return false;
     }
 
-    eth_write_shared_mem(shared_rx_slot_data_offset(tail), data, len);
+    eth_write_shared_rx_payload(shared_rx_slot_data_offset(tail), data, len);
     eth_write_shared_u16(shared_rx_slot_len_offset(tail), len);
+    // CRITICAL: the FPGA reads this slot the moment it observes the advanced
+    // tail, over a NON-coherent HPS->FPGA path. Without a barrier the ARM write
+    // buffer can let the tail update reach DDR before the payload memcpy does,
+    // so the bg copies a half-written slot into the NE2000 ring -> a corrupt
+    // frame the Amiga's TCP silently drops (bad checksum). It only misfires when
+    // slots are written back-to-back (download bursts), is RX-only, and is
+    // invisible to drop counters and to the synchronous-write simulation. Order
+    // payload+len ahead of the tail, and the tail ahead of the RX_AVAIL wake.
+    __sync_synchronize();
+    eth_shared_readback_fence(shared_rx_slot_len_offset(tail));
+    if (len != 0) {
+        eth_shared_readback_fence(shared_rx_slot_data_offset(tail) + len - 1);
+    }
     write_shared_rx_queue_tail(next_tail);
+    __sync_synchronize();
+    eth_shared_readback_fence(ETH_RX_QUEUE_TAIL);
     *flags = eth_update_shared_flags(0, ETH_FLAG_RX_AVAIL);
     g_perf_rx_frames++;
     g_perf_rx_bytes += len;
+    // Integrity probe: running byte-sum of frame bytes we hand to the shm queue
+    // (matches the bg's slot-40 sum of what it writes into the ring).
+    {
+        uint32_t s = 0;
+        for (uint16_t i = 0; i < len; i++) s += data[i];
+        g_sent_csum_run = (g_sent_csum_run + s) & 0xFFFF;
+    }
 
-    eth_debug("ETH: Enqueued shared RX packet slot=%u len=%u head=%u tail->%u\n",
+    eth_trace("ETH: Enqueued shared RX packet slot=%u len=%u head=%u tail->%u\n",
               tail, len, head, next_tail);
 
     if (state) {
@@ -526,8 +869,11 @@ static bool pump_host_rx_queue(uint32_t* flags, struct rtl8019_state* state)
         return false;
     }
 
-    struct host_rx_packet packet = host_rx_queue[host_rx_queue_head];
-    if (!enqueue_shared_rx_packet(packet.data, packet.len, flags, state)) {
+    // Reference the queued packet in place; enqueue copies its bytes into shared
+    // DDR (it never mutates the queue), so there is no need to copy the whole
+    // ~1.5 KB host_rx_packet struct by value first.
+    const struct host_rx_packet* packet = &host_rx_queue[host_rx_queue_head];
+    if (!enqueue_shared_rx_packet(packet->data, packet->len, flags, state)) {
         return false;
     }
 
@@ -655,6 +1001,24 @@ void minimig_eth_init()
         }
     }
 
+    // Enlarge the kernel receive buffer so a TCP download BURST (the server can
+    // now send a full ~64 KB window back-to-back once the Amiga advertises a big
+    // receive window) is absorbed instead of overflowing the socket and being
+    // dropped before our recv() loop drains it. Such drops are invisible to the
+    // FPGA/daemon counters but collapse TCP (loss -> cwnd=1 -> stalls/errors).
+    {
+        int rcvbuf = 4 * 1024 * 1024;   // 4 MB
+        // SO_RCVBUFFORCE (root) bypasses net.core.rmem_max; fall back to SO_RCVBUF.
+        if (setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0 &&
+            setsockopt(raw_socket, SOL_SOCKET, SO_RCVBUF,      &rcvbuf, sizeof(rcvbuf)) < 0) {
+            eth_debug("ETH: Warning: could not enlarge SO_RCVBUF: %s\n", strerror(errno));
+        } else {
+            int got = 0; socklen_t gl = sizeof(got);
+            getsockopt(raw_socket, SOL_SOCKET, SO_RCVBUF, &got, &gl);
+            eth_debug("ETH: RX socket buffer set to %d bytes\n", got);
+        }
+    }
+
     eth_update_shared_status(ETH_STATUS_LINK_UP, 0);
 
     // Print summary of ethernet initialization
@@ -754,38 +1118,117 @@ static bool transmit_packet(const struct tx_request* request)
         return false;
     }
 
-    // Debug: Show first 32 bytes of transmitted packet
-    eth_debug("ETH: Transmitting request seq=%u from addr 0x%04X, length %d bytes:\n",
+#ifdef ETH_TRACE
+    // Per-frame trace (off by default): first 32 bytes of transmitted packet.
+    // The whole dump (loop included) is compiled out unless tracing is enabled.
+    eth_trace("ETH: Transmitting request seq=%u from addr 0x%04X, length %d bytes:\n",
               request->seq, addr, length);
-    eth_debug("ETH: TX Data: ");
+    eth_trace("ETH: TX Data: ");
     for (int i = 0; i < 32 && i < length; i++) {
         uint8_t byte_val = eth_shmem[ETH_TX_BUFFER + i];
-        eth_debug("%02X ", byte_val);
-        if ((i + 1) % 16 == 0) eth_debug("\nETH: TX Data: ");
+        eth_trace("%02X ", byte_val);
+        if ((i + 1) % 16 == 0) eth_trace("\nETH: TX Data: ");
     }
-    eth_debug("\n");
+    eth_trace("\n");
+#endif
 
     // Send the packet staged by the FPGA background DMA path.
     uint8_t* packet_data = eth_shmem + ETH_TX_BUFFER;
+    // Observe the Amiga's advertised TCP receive window (download throughput cap).
+    {
+        int win = tcp_adv_window(packet_data, length);
+        if (win >= 0) {
+            g_perf_tx_win_last = (uint32_t)win;
+            if ((uint32_t)win < g_perf_tx_win_min) g_perf_tx_win_min = (uint32_t)win;
+            if (win == 0) g_perf_tx_zerowin++;
+        }
+    }
+    // Split retx cause: dup-ACKs from the Amiga mean a missing in-bound segment.
+    tcp_track_outgoing_ack(packet_data, length);
     ssize_t sent = send(raw_socket, packet_data, length, 0);
     if (sent < 0) {
         eth_debug("ETH: Failed to send packet: %s\n", strerror(errno));
         state.tx_errors++;
+        g_perf_tx_drop++;                 // egress loss: ACK/data never left the HPS
         write_eth_state_stats(&state);
         return false;
     } else if (sent != length) {
         eth_debug("ETH: Short send: expected %u bytes, sent %zd bytes\n", length, sent);
         state.tx_errors++;
+        g_perf_tx_drop++;                 // egress loss: partial send
         write_eth_state_stats(&state);
         return false;
     } else {
-        eth_debug("ETH: Transmitted packet of %d bytes (total TX: %d)\n", length, state.tx_packets + 1);
+        eth_trace("ETH: Transmitted packet of %d bytes (total TX: %d)\n", length, state.tx_packets + 1);
         state.tx_packets++;
     }
 
     write_eth_state_stats(&state);
     return true;
 }
+
+#ifdef ETH_RX_KERNEL_FILTER
+// Keep a cBPF receive filter installed on the raw socket that matches the
+// Amiga's current station MAC plus broadcast/multicast, so the kernel discards
+// everything else without waking the daemon. Cheap to call every poll: it only
+// (re)attaches when the MAC or promiscuous state actually changes.
+static bool    g_kfilter_active = false;
+static bool    g_kfilter_pro    = false;
+static uint8_t g_kfilter_mac[6] = {0, 0, 0, 0, 0, 0};
+
+static void eth_update_socket_filter(const uint8_t mac[6], bool promiscuous)
+{
+    if (raw_socket < 0) return;
+
+    if (promiscuous) {
+        if (g_kfilter_active) {
+            setsockopt(raw_socket, SOL_SOCKET, SO_DETACH_FILTER, NULL, 0);
+            g_kfilter_active = false;
+            eth_debug("ETH: kernel RX filter detached (promiscuous)\n");
+        }
+        g_kfilter_pro = true;
+        return;
+    }
+
+    bool mac_known = (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) != 0;
+    if (!mac_known) return;   // wait until the FPGA mirrors the station MAC
+
+    if (g_kfilter_active && !g_kfilter_pro && memcmp(mac, g_kfilter_mac, 6) == 0)
+        return;               // already installed for this MAC
+
+    uint32_t mac03 = ((uint32_t)mac[0] << 24) | ((uint32_t)mac[1] << 16) |
+                     ((uint32_t)mac[2] << 8)  |  (uint32_t)mac[3];
+    uint32_t mac45 = ((uint32_t)mac[4] << 8)  |  (uint32_t)mac[5];
+
+    // dst[4:5]==mac45 && dst[0:3]==mac03 -> accept (unicast to Amiga);
+    // else if (dst[0] & 1) -> accept (broadcast/multicast); else drop.
+    struct sock_filter code[] = {
+        BPF_STMT(BPF_LD  | BPF_H | BPF_ABS, 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, mac45, 0, 3),
+        BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, mac03, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xFFFF),
+        BPF_STMT(BPF_LD  | BPF_B | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 1, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xFFFF),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    struct sock_fprog prog;
+    prog.len    = (unsigned short)(sizeof(code) / sizeof(code[0]));
+    prog.filter = code;
+
+    if (setsockopt(raw_socket, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) < 0) {
+        eth_debug("ETH: SO_ATTACH_FILTER failed: %s (continuing unfiltered)\n", strerror(errno));
+        g_kfilter_active = false;
+        return;
+    }
+    memcpy(g_kfilter_mac, mac, 6);
+    g_kfilter_active = true;
+    g_kfilter_pro = false;
+    eth_debug("ETH: kernel RX filter installed for %02X:%02X:%02X:%02X:%02X:%02X (+bcast/mcast)\n",
+              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+#endif // ETH_RX_KERNEL_FILTER
 
 // Receive packet from host ethernet
 void receive_packet()
@@ -807,6 +1250,11 @@ void receive_packet()
 
     rcr = read_ne_register(0, 0x0C);
     read_shared_mac(mac_addr);
+
+#ifdef ETH_RX_KERNEL_FILTER
+    // Keep the in-kernel receive filter in sync with the Amiga's MAC / promisc.
+    eth_update_socket_filter(mac_addr, (rcr & NE_RCR_PRO) != 0);
+#endif
 
     while (pump_host_rx_queue(&flags, &state)) {
     }
@@ -842,6 +1290,14 @@ void receive_packet()
         }
         else if (memcmp(buffer, "\xFF\xFF\xFF\xFF\xFF\xFF", 6) == 0) {
             accept = (rcr & NE_RCR_AB) != 0;
+#ifdef ETH_RX_BROADCAST_DENOISE
+            // Forward only broadcast the Amiga actually needs; drop LAN floods
+            // on the HPS side so they never interrupt/burden the 68020.
+            if (accept && !broadcast_is_essential(buffer, (uint16_t)len)) {
+                accept = false;
+                g_perf_bcast_drop++;
+            }
+#endif
         }
         else if (buffer[0] & 0x01) {
             accept = (rcr & NE_RCR_AM) && multicast_hash_match(buffer);
@@ -856,24 +1312,44 @@ void receive_packet()
 
         uint16_t packet_len = (uint16_t)len;
 
-        if (enqueue_shared_rx_packet(buffer, packet_len, &flags, &state)) {
-        } else if (!enqueue_host_rx_packet(buffer, packet_len)) {
-            g_perf_rx_drop++;
-            eth_debug("ETH: RX software queue full, dropping packet of %u bytes\n", packet_len);
-            state.rx_errors++;
-        } else {
-            g_perf_rx_defer++;
-            eth_debug("ETH: Deferred RX packet of %u bytes in host queue (depth: %u)\n",
-                      packet_len, host_rx_queue_count);
+        // Ground-truth RX loss measurement: count server retransmits on the
+        // download stream (see tcp_track_download). Done on every accepted
+        // frame; non-TCP / pure-ACK frames are ignored inside the helper.
+        tcp_track_download(buffer, packet_len);
+
+        // Strict FIFO across the shm + host queues. Drain anything already
+        // deferred into shm first, and only fast-path THIS frame straight to shm
+        // when nothing is waiting ahead of it. Without this, once a burst fills
+        // shm and a frame is deferred to the host queue, the very next frame can
+        // find a freed shm slot and OVERTAKE the deferred one -> out-of-order
+        // delivery to the Amiga -> dup-ACKs -> TCP fast-retransmit/cwnd collapse
+        // (observed as dupAck>0 with retx~0 and stalled/aborted downloads).
+        while (pump_host_rx_queue(&flags, &state)) {
+        }
+        bool queued = (host_rx_queue_count == 0) &&
+                      enqueue_shared_rx_packet(buffer, packet_len, &flags, &state);
+        if (!queued) {
+            if (!enqueue_host_rx_packet(buffer, packet_len)) {
+                g_perf_rx_drop++;
+                eth_debug("ETH: RX software queue full, dropping packet of %u bytes\n", packet_len);
+                state.rx_errors++;
+            } else {
+                g_perf_rx_defer++;
+                eth_debug("ETH: Deferred RX packet of %u bytes in host queue (depth: %u)\n",
+                          packet_len, host_rx_queue_count);
+            }
         }
 
-        // Debug: Show first 32 bytes of received packet
-        eth_debug("ETH: RX Data: ");
+#ifdef ETH_TRACE
+        // Per-frame trace (off by default): first 32 bytes of received packet.
+        // The whole dump (loop included) is compiled out unless tracing is enabled.
+        eth_trace("ETH: RX Data: ");
         for (int i = 0; i < 32 && i < len; i++) {
-            eth_debug("%02X ", buffer[i]);
-            if ((i + 1) % 16 == 0) eth_debug("\nETH: RX Data: ");
+            eth_trace("%02X ", buffer[i]);
+            if ((i + 1) % 16 == 0) eth_trace("\nETH: RX Data: ");
         }
-        eth_debug("\n");
+        eth_trace("\n");
+#endif
     }
 
     write_eth_state_stats(&state);
@@ -894,11 +1370,18 @@ void minimig_eth_poll()
         // Check for control flags from FPGA via shared memory
         uint32_t flags = eth_read_shared_u32(ETH_CTRL_FLAGS);
         
-        // Update heartbeat counter every poll
-        hps_heartbeat_counter++;
-        eth_write_shared_u32(ETH_HPS_HEARTBEAT, hps_heartbeat_counter);
-        eth_write_shared_u32(ETH_HPS_SIGNATURE, ETH_HPS_SIGNATURE_MAGIC);
-        eth_update_shared_status(ETH_STATUS_LINK_UP, 0);
+        // Heartbeat/signature/status only need to refresh fast enough for the
+        // FPGA's liveness sampling (it reads them on a slow cadence). Updating
+        // every poll burned ~3 shared-DDR writes x ~27k polls/s for no benefit;
+        // refresh every 64 polls (~hundreds/s) instead. The signature/status are
+        // constants, so rewriting them less often is harmless.
+        static uint32_t hb_throttle = 0;
+        if ((hb_throttle++ & 0x3F) == 0) {
+            hps_heartbeat_counter++;
+            eth_write_shared_u32(ETH_HPS_HEARTBEAT, hps_heartbeat_counter);
+            eth_write_shared_u32(ETH_HPS_SIGNATURE, ETH_HPS_SIGNATURE_MAGIC);
+            eth_update_shared_status(ETH_STATUS_LINK_UP, 0);
+        }
 
         // --- throughput measurement: one summary line per second ---
         g_perf_polls++;
@@ -911,21 +1394,88 @@ void minimig_eth_poll()
                              (perf_now.tv_nsec - perf_last.tv_nsec) / 1e9;
             if (perf_dt >= 1.0) {
                 static uint64_t p_rxf = 0, p_rxb = 0, p_txf = 0, p_txb = 0;
-                static uint64_t p_pl = 0, p_df = 0, p_dr = 0;
+                static uint64_t p_pl = 0, p_df = 0, p_dr = 0, p_bc = 0;
+                static uint8_t  p_ovw = 0;
                 double rxf = (g_perf_rx_frames - p_rxf) / perf_dt;
                 double rxk = (g_perf_rx_bytes  - p_rxb) / perf_dt / 1024.0;
                 double txf = (g_perf_tx_frames - p_txf) / perf_dt;
                 double txk = (g_perf_tx_bytes  - p_txb) / perf_dt / 1024.0;
                 double pls = (g_perf_polls     - p_pl)  / perf_dt;
-                eth_debug("ETHPERF: RX %.0f fps %.1f KB/s | TX %.0f fps %.1f KB/s | "
-                          "defer %llu drop %llu hostQ %u | poll %.0f/s\n",
-                          rxf, rxk, txf, txk,
-                          (unsigned long long)(g_perf_rx_defer - p_df),
-                          (unsigned long long)(g_perf_rx_drop  - p_dr),
-                          (unsigned)host_rx_queue_count, pls);
+                double bcd = (g_perf_bcast_drop - p_bc) / perf_dt;
+                // NE2000 RX ring health: CNTR2 (reg 0x0D) counts RX-ring overflow
+                // drops (the FPGA bg increments it when the ring is full and a
+                // frame is discarded); CURR vs BNRY shows how full the ring is.
+                // If ovwDrop climbs during a download, the Amiga isn't draining
+                // the ring fast enough -> frames lost -> TCP backs off (drop-
+                // driven slowness). If ovwDrop stays 0 and rx KB/s is still low,
+                // the limit is the Amiga's TCP receive window, not the path.
+                uint8_t ovw  = read_ne_register(0, 0x0D);   // CNTR2 (overflow drops)
+                uint8_t curr = read_ne_register(1, 0x07);   // FPGA write page
+                uint8_t bnry = read_ne_register(0, 0x03);   // driver read page
+                uint8_t ovw_delta = (uint8_t)(ovw - p_ovw);
+                static uint64_t p_zw = 0;
+                // Amiga advertised receive window this interval (min seen / last).
+                // 0xFFFFFFFF min means no TCP ACK was observed this second.
+                long amiga_win_min = (g_perf_tx_win_min == 0xFFFFFFFF) ? -1
+                                     : (long)g_perf_tx_win_min;
+                // Kernel raw-socket stats: tp_drops = frames the KERNEL dropped
+                // because the socket buffer was full before our recv() drained it
+                // -- the silent RX loss point that collapses TCP. Reading
+                // PACKET_STATISTICS resets the counters, so this is per-interval.
+                unsigned sock_pkts = 0, sock_drops = 0;
+                if (raw_socket >= 0) {
+                    struct tpacket_stats pst;
+                    socklen_t pl = sizeof(pst);
+                    if (getsockopt(raw_socket, SOL_PACKET, PACKET_STATISTICS, &pst, &pl) == 0) {
+                        sock_pkts  = pst.tp_packets;
+                        sock_drops = pst.tp_drops;
+                    }
+                }
+                // Integrity-probe compare -- only on a fully IDLE second (no RX in
+                // flight) so the bg has delivered everything enqueued and slot 40
+                // has settled. bg slot-40 csum (0x110A) is byte-swapped vs ours.
+                {
+                    uint16_t hd = read_shared_rx_queue_head();
+                    uint16_t tl = read_shared_rx_queue_tail();
+                    if (rxf < 1.0 && hd == tl && host_rx_queue_count == 0) {
+                        uint16_t raw = eth_read_shared_u16(0x110A);
+                        uint16_t bg_csum = (uint16_t)((raw << 8) | (raw >> 8));
+                        uint16_t diff = (uint16_t)(bg_csum - (uint16_t)g_sent_csum_run);
+                        static int have_diff = 0; static uint16_t last_diff = 0;
+                        if (have_diff && diff != last_diff) g_perf_deliv_bad++;
+                        last_diff = diff; have_diff = 1;
+                    }
+                }
+                static uint64_t p_tm = 0, p_retx = 0, p_da = 0, p_gap = 0, p_txd = 0;
+                eth_perf("ETHPERF: RX %.0f fps %.1f KB/s | TX %.0f fps %.1f KB/s | "
+                         "amigaWin min=%ld last=%u zeroWin=%llu/s txMiss=%llu/s txDrop=%llu/s "
+                         "retx=%llu/s dupAck=%llu/s rxGap=%llu/s delivBad=%llu retxAck=%llu retxDat=%llu | "
+                         "sockDrop %u sockPkts %u | "
+                         "ovwDrop %u/s ringCURR=0x%02X BNRY=0x%02X | "
+                         "bcastDrop %.0f/s defer %llu drop %llu hostQ %u | poll %.0f/s\n",
+                         rxf, rxk, txf, txk,
+                         amiga_win_min, (unsigned)g_perf_tx_win_last,
+                         (unsigned long long)(g_perf_tx_zerowin - p_zw),
+                         (unsigned long long)(g_perf_tx_miss - p_tm),
+                         (unsigned long long)(g_perf_tx_drop - p_txd),
+                         (unsigned long long)(g_perf_rx_retx - p_retx),
+                         (unsigned long long)(g_perf_dup_ack - p_da),
+                         (unsigned long long)(g_perf_rx_gap - p_gap),
+                         (unsigned long long)g_perf_deliv_bad,
+                         (unsigned long long)g_perf_retx_ack,
+                         (unsigned long long)g_perf_retx_dat,
+                         sock_drops, sock_pkts,
+                         (unsigned)ovw_delta, (unsigned)curr, (unsigned)bnry, bcd,
+                         (unsigned long long)(g_perf_rx_defer - p_df),
+                         (unsigned long long)(g_perf_rx_drop  - p_dr),
+                         (unsigned)host_rx_queue_count, pls);
                 p_rxf = g_perf_rx_frames; p_rxb = g_perf_rx_bytes;
                 p_txf = g_perf_tx_frames; p_txb = g_perf_tx_bytes;
                 p_pl  = g_perf_polls; p_df = g_perf_rx_defer; p_dr = g_perf_rx_drop;
+                p_bc  = g_perf_bcast_drop; p_ovw = ovw; p_zw = g_perf_tx_zerowin;
+                p_tm  = g_perf_tx_miss; p_retx = g_perf_rx_retx; p_da = g_perf_dup_ack;
+                p_gap = g_perf_rx_gap;  p_txd = g_perf_tx_drop;
+                g_perf_tx_win_min = 0xFFFFFFFF;   // reset per-interval min
                 perf_last = perf_now;
             }
         }
@@ -974,6 +1524,13 @@ void minimig_eth_poll()
         if ((flags & ETH_FLAG_TX_REQ) || tx_sequence_pending) {
             struct tx_request request = read_shared_tx_request();
             if ((request.seq != 0) && (request.seq != hps_last_tx_complete_seq)) {
+                // Detect TX frames the FPGA staged but we never sent: the seq
+                // should advance by exactly 1; a larger gap means the single shm
+                // TX buffer was overwritten before we drained it (lost ACKs).
+                if (hps_last_tx_complete_seq != 0) {
+                    uint16_t tx_gap = (uint16_t)(request.seq - hps_last_tx_complete_seq);
+                    if (tx_gap > 1) g_perf_tx_miss += (tx_gap - 1);
+                }
                 eth_update_shared_status(ETH_STATUS_TX_OK | ETH_STATUS_TX_ERR, 0);
                 bool tx_ok = transmit_packet(&request);
                 if (tx_ok) { g_perf_tx_frames++; g_perf_tx_bytes += request.len; }
