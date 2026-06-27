@@ -18,6 +18,11 @@
 #include <stdint.h>
 
 #include "minimig_eth.h"
+#include "eth_gso.h"
+
+// recv() scratch buffer large enough to hold a fully GRO/LRO-coalesced superframe
+// (kernel gso_max ~64KB) so software GSO can re-split it; see the RX intake loop.
+#define ETH_RX_JUMBO_SIZE 65600
 
 #if __has_include("../../MiSTer_Main/Main_MiSTer/shmem.h")
 #include "../../MiSTer_Main/Main_MiSTer/shmem.h"
@@ -124,6 +129,28 @@ static uint8_t host_rx_queue_count = 0;
 // ---------------------------------------------------------------------------
 static uint64_t g_perf_rx_frames = 0, g_perf_rx_bytes = 0;
 static uint64_t g_perf_rx_defer  = 0, g_perf_rx_drop  = 0;
+// RX frames dropped for exceeding max Ethernet (1518B). >0 means the host NIC is
+// still coalescing receives (GRO/LRO) into oversized superframes the NE2000 ring
+// cannot hold -- a server-dependent corruption that never occurs on real X-Surf HW.
+static uint64_t g_perf_rx_oversize = 0;
+// Segments produced by software-GSO re-segmentation of GRO/LRO-coalesced
+// superframes (keeps host receive offload on; see eth_gso.h / the RX intake).
+static uint64_t g_perf_rx_seg = 0;
+// Frames whose IPv4/L4 checksums were normalized in software before delivery to
+// the Amiga.  This makes host RX offload/GRO checksum metadata irrelevant to the
+// emulated NIC: the Amiga always sees ordinary wire-valid Ethernet frames.
+static uint64_t g_perf_rx_csum_fix = 0;
+// Valid short frames Linux delivered with Ethernet padding stripped and we
+// restored to the 60-byte minimum before handing them to the emulated RTL8019.
+static uint64_t g_perf_rx_padded = 0;
+// AF_PACKET echo copies that Linux reports for frames transmitted by this host.
+// Feeding these back into the emulated NIC causes duplicate packets, e.g. ping
+// reporting (DUP!).
+static uint64_t g_perf_rx_echo_drop = 0;
+// Accepted RX frames that were exact near-immediate duplicates at the raw socket.
+// These are usually bridge/promisc recirculation copies presented as inbound
+// PACKET_HOST, so PACKET_OUTGOING filtering does not catch them.
+static uint64_t g_perf_rx_dup_drop = 0;
 static uint64_t g_perf_tx_frames = 0, g_perf_tx_bytes = 0;
 static uint64_t g_perf_polls     = 0;
 static uint64_t g_perf_bcast_drop = 0;   // broadcast frames denoised (not forwarded)
@@ -163,14 +190,65 @@ static uint64_t g_perf_rx_gap      = 0;
 // the HPS. txDrop>0 with retx>0 and dupAck~0 == ACKs lost on egress, not on RX.
 static uint64_t g_perf_tx_drop     = 0;
 // Integrity probe: the FPGA bg publishes a running 16-bit byte-sum of every RX
-// payload byte it writes into the ring (sync slot 40, shm 0x110A, byte-swapped).
-// We keep the same running sum of frame bytes handed to the shm queue. At
-// quiescence (shm RX queue + host queue both empty) the bg has delivered exactly
-// what we enqueued, so the two sums differ by a CONSTANT offset (reset skew). If
-// that offset CHANGES between quiescent samples, a frame was corrupted in shm->bg
-// (mailbox/CDC) -- delivBad counts those events.
+// payload byte it writes into the ring (sync slot 40, shm 0x110A, byte-swapped)
+// AND a count of frames it has delivered (sync slot 41, shm 0x110C). We keep the
+// same running sum + count for the frames we enqueue, and compare the two sums
+// ONLY when the bg's count equals ours (it has delivered exactly the frames we
+// enqueued) and is stable across the read -- then both sums cover the identical
+// frame set, so an inequality is a real shm->ring (bg write) corruption rather
+// than a reset/origin offset. A match here while retxDat>0 proves the loss is
+// DOWNSTREAM of the bg write (data-port read or the Amiga), not FPGA delivery.
 static uint64_t g_perf_deliv_bad   = 0;
 static uint32_t g_sent_csum_run    = 0;   // daemon running byte-sum (16-bit)
+static uint16_t g_sent_frame_count = 0;   // daemon RX frames enqueued (count tag, matches bg slot 41)
+static int      g_csum_calibrated  = 0;   // origin-aligned to the bg counters on first caught-up sample
+static uint16_t g_perf_csum_bg     = 0;   // last bg running byte-sum read (for the ETHPERF line)
+static uint16_t g_perf_cnt_bg      = 0;   // last bg frame count read
+static uint16_t g_perf_deliv_bad_frame = 0; // bg frame count at the first detected divergence
+static int      g_rx_verify        = 0;   // OFF by default (the slot read-back is a heavy O(len) uncached diagnostic
+                                          // that perturbs the RX hot path); set MINIMIG_ETH_RX_VERIFY=1 to enable
+static uint64_t g_perf_wr_bad      = 0;   // frames whose slot read-back != intended (the uncached COPY dropped bytes)
+static uint32_t g_rx_settle_us     = 0;   // MINIMIG_ETH_RX_SETTLE_US: spin this long after the payload write, before
+                                          // advancing the tail, so the slot commits to SDRAM for the f2sdram read port
+                                          // (closes the HPS->FPGA cross-port visibility race wrBad=0 proved is the cause)
+// Delivery PACING (burst-overrun test): a real 10 Mbit NE2000 spaces frames ~1.2ms
+// apart; our bg delivers a window's worth (~3 segments) back-to-back in us, which
+// may overrun Roadshow's TCP input -> ~half the frames dropped -> retxDat -> the
+// 301-vs-1026 kbit/s gap. Enforce a MINIMUM interval between consecutive RX
+// deliveries (tail advances): throttles the microbursts but adds ZERO latency to
+// already-spaced frames (between bursts / the fast regime), so it can only help.
+// Tune ETH_RX_PACE_US (sweep e.g. 400 / 800 / 1500); 0 disables. Env override:
+// MINIMIG_ETH_RX_PACE_US.
+#define ETH_RX_PACE_US 0
+static uint32_t g_rx_pace_us       = ETH_RX_PACE_US;
+// Read-side probe (FPGA slots 42/43): ringWr = bytes the bg WROTE into the NE2000
+// ring; dpRd = bytes the 68k READ back via the data port. Equal at a ring drain
+// iff the 68k reads the ring intact. rdBad counts drains where they diverged.
+static uint16_t g_perf_ring_wr     = 0;
+static uint16_t g_perf_dp_rd       = 0;
+static uint64_t g_perf_rd_bad      = 0;
+// Per-frame read-corruption probe (FPGA slot 44): count of even-length payload
+// reads where the 68k pulled different bytes than the bg wrote. >0 = data-port
+// READ corruption PROVEN; ==0 = the 68k reads the ring intact (loss is Amiga/TCP).
+static uint16_t g_perf_rd_corrupt  = 0;
+static uint16_t g_perf_rd_checked  = 0;   // payload reads compared; 0 => probe never armed (rdCorrupt inconclusive)
+static uint16_t g_perf_rd_bad_exp  = 0;   // last mismatched expected payload checksum
+static uint16_t g_perf_rd_bad_act  = 0;   // last mismatched actual payload checksum
+// WRITE/storage read-back probe (FPGA slots 46/47): the bg re-reads each 1-page
+// frame's payload through PORT A and compares it to the checksum it intended to
+// write. rbBad>0 = the M10K WRITE/storage dropped/corrupted bytes; rbBad==0 while
+// the 68k still sees corruption isolates the fault to the port-B READ path.
+static uint16_t g_perf_rb_bad      = 0;   // frames where port-A read-back != frame_wr_csum
+static uint16_t g_perf_rb_csum_run = 0;   // running port-A read-back byte-sum, all probed frames
+static uint16_t g_perf_tx_mirror_csum   = 0; // TXM: Amiga data-port writes captured into FPGA mirror
+static uint16_t g_perf_tx_mirror_frames = 0;
+static uint16_t g_perf_tx_drain_csum    = 0; // TXD: FPGA mirror drained into ETH_TX_BUFFER
+static uint16_t g_perf_tx_drain_frames  = 0;
+static uint16_t g_perf_tx_mirror_bytes  = 0;
+static uint16_t g_perf_tx_drain_bytes   = 0;
+static uint16_t g_tx_hps_csum_run       = 0; // TXH: HPS bytes read from ETH_TX_BUFFER
+static uint16_t g_tx_hps_frame_count    = 0;
+static uint16_t g_tx_hps_byte_count     = 0;
 // DIAGNOSTIC: outgoing TX frames (usually Amiga ACKs) whose IP or TCP checksum is
 // INVALID as staged in shm. Such a frame is send()'d on the wire but silently
 // dropped by the peer's stack on checksum -> the server keeps retransmitting
@@ -180,6 +258,10 @@ static uint32_t g_sent_csum_run    = 0;   // daemon running byte-sum (16-bit)
 // delayed -- which the sub-ms FPGA/daemon scheduling delays cannot explain at a
 // ~200ms RTO. This is observe-only: the frame is still sent unchanged.
 static uint64_t g_perf_tx_bad_csum = 0;
+// Outgoing frames whose IPv4/L4 checksums were written in software before
+// AF_PACKET send().  Packet sockets do not provide CHECKSUM_PARTIAL metadata, so
+// never rely on eth0 TX checksum offload to finish an Amiga frame.
+static uint64_t g_perf_tx_csum_fix = 0;
 // DIAGNOSTIC (HPS-bottleneck probe): is the daemon itself slowing RX? Per ETHPERF
 // interval we record the worst-case microseconds spent in one receive_packet()
 // call (recvMaxUs), the most RX frames drained in one such call (recvFrMax), and
@@ -196,6 +278,60 @@ static inline uint64_t eth_mono_us(void)
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+#define ETH_RX_DEDUPE_SLOTS     32
+#define ETH_RX_DEDUPE_WINDOW_US 20000
+
+struct eth_rx_dedupe_entry {
+    uint64_t t_us;
+    uint32_t hash;
+    uint32_t len;
+    uint16_t ethertype;
+};
+
+static struct eth_rx_dedupe_entry g_rx_dedupe[ETH_RX_DEDUPE_SLOTS];
+static uint8_t g_rx_dedupe_next = 0;
+static uint32_t g_rx_dedupe_window_us = ETH_RX_DEDUPE_WINDOW_US;
+
+static uint32_t eth_rx_frame_hash(const uint8_t *data, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+static bool eth_rx_is_near_duplicate(const uint8_t *data, size_t len)
+{
+    if (g_rx_dedupe_window_us == 0 || len < 14) {
+        return false;
+    }
+
+    uint64_t now = eth_mono_us();
+    uint32_t hash = eth_rx_frame_hash(data, len);
+    uint16_t ethertype = ((uint16_t)data[12] << 8) | data[13];
+
+    for (unsigned i = 0; i < ETH_RX_DEDUPE_SLOTS; i++) {
+        const struct eth_rx_dedupe_entry *e = &g_rx_dedupe[i];
+        if (e->t_us != 0 &&
+            e->hash == hash &&
+            e->len == len &&
+            e->ethertype == ethertype &&
+            (now - e->t_us) <= g_rx_dedupe_window_us) {
+            return true;
+        }
+    }
+
+    struct eth_rx_dedupe_entry *slot = &g_rx_dedupe[g_rx_dedupe_next];
+    slot->t_us = now;
+    slot->hash = hash;
+    slot->len = (uint32_t)len;
+    slot->ethertype = ethertype;
+    g_rx_dedupe_next = (uint8_t)((g_rx_dedupe_next + 1) % ETH_RX_DEDUPE_SLOTS);
+    return false;
+}
+
 // Daemon-side TCP receive-window CLAMP. The download bottleneck is NOT loss
 // (Amiga reports 0 dropped / 0 overruns, rxGap=0, txBadCsum=0): it is the slow
 // 68020 ACK pacing racing the server's ~200ms RTO while the Amiga advertises a
@@ -207,7 +343,8 @@ static inline uint64_t eth_mono_us(void)
 // pipe full (8KB/30ms RTT = ~266 KB/s ceiling, far above the ~40 KB/s the Amiga
 // moves) while bounding the backlog under one RTO. 0 disables. NOTE: assumes no
 // TCP window scaling -- valid here since amigaWin maxes at 65535 (scale 0).
-#define ETH_TX_WINDOW_CLAMP 4096
+#define ETH_TX_WINDOW_CLAMP 0
+//32768
 static uint64_t g_perf_tx_win_clamped = 0;
 
 // Access ethernet shared memory through mapped region
@@ -334,6 +471,157 @@ static bool eth_read_text_file(const char* path, char* buffer, size_t buffer_siz
     }
 
     return true;
+}
+
+static bool eth_copy_interface_name(const char *name)
+{
+    if (!name || !name[0]) {
+        return false;
+    }
+
+    size_t len = strlen(name);
+    if (len >= sizeof(bridge_interface)) {
+        return false;
+    }
+
+    memcpy(bridge_interface, name, len + 1);
+    return true;
+}
+
+static bool eth_interface_has_sysfs_file(const char *name, const char *leaf)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/%s", name, leaf);
+    return access(path, F_OK) == 0;
+}
+
+static bool eth_name_has_prefix(const char *name, const char *prefix)
+{
+    return strncmp(name, prefix, strlen(prefix)) == 0;
+}
+
+static bool eth_interface_is_auto_bad(const char *name)
+{
+    if (eth_interface_has_sysfs_file(name, "bridge") ||
+        eth_interface_has_sysfs_file(name, "tun_flags")) {
+        return true;
+    }
+
+    return eth_name_has_prefix(name, "br-")     ||
+           eth_name_has_prefix(name, "docker") ||
+           eth_name_has_prefix(name, "veth")   ||
+           eth_name_has_prefix(name, "virbr")  ||
+           eth_name_has_prefix(name, "tap")    ||
+           eth_name_has_prefix(name, "tun");
+}
+
+static bool eth_interface_has_afpacket_addr(const char *name)
+{
+    struct ifaddrs *ifaddr = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        return false;
+    }
+
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || strcmp(ifa->ifa_name, name) != 0) {
+            continue;
+        }
+        if (ifa->ifa_addr->sa_family == AF_PACKET) {
+            found = true;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found;
+}
+
+static bool eth_interface_is_usable(int fd, const char *name)
+{
+    if (!name || !name[0]) {
+        return false;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+        return false;
+    }
+    if (!(ifr.ifr_flags & IFF_UP) || (ifr.ifr_flags & IFF_LOOPBACK)) {
+        return false;
+    }
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        return false;
+    }
+
+    return eth_interface_has_afpacket_addr(name);
+}
+
+static bool eth_select_bridge_interface(int fd)
+{
+    const char *env_iface = getenv("MINIMIG_ETH_IFACE");
+    if (env_iface && env_iface[0]) {
+        if (!eth_copy_interface_name(env_iface)) {
+            eth_perf("ETH: MINIMIG_ETH_IFACE='%s' is too long\n", env_iface);
+            return false;
+        }
+        if (!eth_interface_is_usable(fd, bridge_interface)) {
+            eth_perf("ETH: MINIMIG_ETH_IFACE='%s' is not a usable UP AF_PACKET interface\n",
+                     bridge_interface);
+            return false;
+        }
+        eth_perf("ETH: Using interface %s from MINIMIG_ETH_IFACE\n", bridge_interface);
+        return true;
+    }
+
+    if (eth_interface_is_usable(fd, bridge_interface)) {
+        eth_perf("ETH: Using default interface %s\n", bridge_interface);
+        return true;
+    }
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) == -1) {
+        return false;
+    }
+
+    const char *chosen = NULL;
+    for (int pass = 0; pass < 3 && !chosen; pass++) {
+        for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) {
+                continue;
+            }
+            if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) {
+                continue;
+            }
+            if (!eth_interface_is_usable(fd, ifa->ifa_name)) {
+                continue;
+            }
+
+            bool has_device = eth_interface_has_sysfs_file(ifa->ifa_name, "device");
+            bool auto_bad = eth_interface_is_auto_bad(ifa->ifa_name);
+            if (pass == 0 && (!has_device || auto_bad)) {
+                continue;
+            }
+            if (pass == 1 && auto_bad) {
+                continue;
+            }
+
+            chosen = ifa->ifa_name;
+            break;
+        }
+    }
+
+    bool ok = chosen && eth_copy_interface_name(chosen);
+    freeifaddrs(ifaddr);
+
+    if (ok) {
+        eth_perf("ETH: Using auto-selected interface %s\n", bridge_interface);
+    }
+    return ok;
 }
 
 static uint16_t eth_detect_link_status_bits(void)
@@ -673,6 +961,7 @@ static void tcp_track_outgoing_ack(const uint8_t* d, uint16_t len)
 }
 
 // Helper functions to access NE2000 memory directly from shared memory
+static uint8_t read_ne_memory(uint16_t addr) __attribute__((unused));
 static uint8_t read_ne_memory(uint16_t addr)
 {
     uint32_t shared_offset;
@@ -839,6 +1128,26 @@ static bool enqueue_shared_rx_packet(const uint8_t* data, uint16_t len, uint32_t
     if (len != 0) {
         eth_shared_readback_fence(shared_rx_slot_data_offset(tail) + len - 1);
     }
+    // Cross-port settling: wrBad=0 proves the payload IS in DDR from the ARM's
+    // view, yet the bg's f2sdram read still sees stale bytes (csBG!=csTX) when
+    // slots are reused fast. The ARM-side barriers above don't guarantee the write
+    // has committed to the SDRAM array for the FPGA's f2sdram read port. Spin a
+    // tunable settle window before exposing the slot (advancing the tail) so the
+    // commit lands first. 0 = off (default).
+    if (g_rx_settle_us) {
+        uint64_t t0 = eth_mono_us();
+        while ((eth_mono_us() - t0) < g_rx_settle_us) { __sync_synchronize(); }
+    }
+    // Delivery pacing: enforce a minimum interval between consecutive tail advances
+    // (= deliveries to the Amiga). Only throttles back-to-back microbursts; frames
+    // already >= pace apart pass with no delay.
+    if (g_rx_pace_us) {
+        static uint64_t last_deliver_us = 0;
+        if (last_deliver_us) {
+            while ((eth_mono_us() - last_deliver_us) < g_rx_pace_us) { __sync_synchronize(); }
+        }
+        last_deliver_us = eth_mono_us();
+    }
     write_shared_rx_queue_tail(next_tail);
     __sync_synchronize();
     eth_shared_readback_fence(ETH_RX_QUEUE_TAIL);
@@ -851,10 +1160,32 @@ static bool enqueue_shared_rx_packet(const uint8_t* data, uint16_t len, uint32_t
     g_perf_rx_bytes += len;
     // Integrity probe: running byte-sum of frame bytes we hand to the shm queue
     // (matches the bg's slot-40 sum of what it writes into the ring).
+    //
+    // SPLIT TEST (MINIMIG_ETH_RX_VERIFY=1): the csBG!=csTX verdict proved the bg
+    // pulls DIFFERENT bytes from shm than we sent on large download frames. That is
+    // either (A) our uncached staged->slot copy dropping bytes, or (B) the bg's
+    // f2sdram read seeing a partially-written slot (the HPS->FPGA non-coherent
+    // ordering the barriers above are meant to close, but only guarantee ARM-side
+    // completion, not f2sdram-read-side visibility). To split them: after the copy
+    // + barriers, read the slot BACK through our own /dev/mem view and sum THAT.
+    //   intended != slot_readback  -> (A) the copy itself is broken (daemon fix)
+    //   intended == slot_readback but csBG != csTX -> (B) f2sdram read race (FPGA fix)
+    // Use the read-back (actual DDR, ARM view) for g_sent_csum_run so the running
+    // csBG-vs-csTX compare isolates the f2sdram READ path. Gated (O(len) uncached
+    // reads add bus traffic that can perturb the very race) -- enable for the run.
     {
-        uint32_t s = 0;
-        for (uint16_t i = 0; i < len; i++) s += data[i];
-        g_sent_csum_run = (g_sent_csum_run + s) & 0xFFFF;
+        uint32_t intended = 0;
+        for (uint16_t i = 0; i < len; i++) intended += data[i];
+        uint32_t slot_sum = intended;
+        if (g_rx_verify && len != 0) {
+            volatile uint8_t *slot = (volatile uint8_t *)eth_shmem + shared_rx_slot_data_offset(tail);
+            uint32_t rb = 0;
+            for (uint16_t i = 0; i < len; i++) rb += slot[i];
+            slot_sum = rb;
+            if ((rb & 0xFFFF) != (intended & 0xFFFF)) g_perf_wr_bad++;
+        }
+        g_sent_csum_run = (g_sent_csum_run + slot_sum) & 0xFFFF;
+        g_sent_frame_count++;   // count tag: matches the bg's slot-41 frame counter
     }
 
     eth_trace("ETH: Enqueued shared RX packet slot=%u len=%u head=%u tail->%u\n",
@@ -925,6 +1256,44 @@ static bool pump_host_rx_queue(uint32_t* flags, struct rtl8019_state* state)
     return true;
 }
 
+// Deliver one <=MTU frame to the Amiga under strict FIFO: drain anything already
+// deferred into shm first, fast-path this frame to shm only when nothing is queued
+// ahead of it, else defer it to the host queue (preserves in-order delivery so the
+// Amiga's TCP doesn't see reordering -> dup-ACKs -> cwnd collapse).
+static void deliver_rx_frame(const uint8_t* data, uint16_t len,
+                             uint32_t* flags, struct rtl8019_state* state)
+{
+    while (pump_host_rx_queue(flags, state)) {
+    }
+    bool queued = (host_rx_queue_count == 0) &&
+                  enqueue_shared_rx_packet(data, len, flags, state);
+    if (!queued) {
+        if (!enqueue_host_rx_packet(data, len)) {
+            g_perf_rx_drop++;
+            eth_debug("ETH: RX software queue full, dropping packet of %u bytes\n", len);
+            state->rx_errors++;
+        } else {
+            g_perf_rx_defer++;
+            eth_debug("ETH: Deferred RX packet of %u bytes in host queue (depth: %u)\n",
+                      len, host_rx_queue_count);
+        }
+    }
+}
+
+// Sink for software-GSO re-segmentation: each <=MTU segment is loss-tracked and
+// delivered in order, exactly like a natively received frame.
+struct eth_gso_deliver_ctx {
+    uint32_t* flags;
+    struct rtl8019_state* state;
+};
+static void eth_gso_deliver_seg(void* ctx, const uint8_t* frame, int len)
+{
+    struct eth_gso_deliver_ctx* c = (struct eth_gso_deliver_ctx*)ctx;
+    g_perf_rx_csum_fix++;
+    tcp_track_download(frame, (uint16_t)len);
+    deliver_rx_frame(frame, (uint16_t)len, c->flags, c->state);
+}
+
 // Initialize ethernet emulation
 void minimig_eth_init()
 {
@@ -937,6 +1306,36 @@ void minimig_eth_init()
     }
 
     eth_debug("Initializing RTL8019 ethernet emulation\n");
+
+    // Integrity-probe split test: MINIMIG_ETH_RX_VERIFY=1 makes enqueue read each
+    // slot back from DDR after the copy+barriers and compare to the intended sum,
+    // so wrBad isolates an uncached COPY bug from an f2sdram READ visibility race.
+    {
+        const char *v = getenv("MINIMIG_ETH_RX_VERIFY");
+        if (v && v[0]) g_rx_verify = (v[0] != '0') ? 1 : 0;   // default ON; env only needed to disable
+        eth_debug("ETH: MINIMIG_ETH_RX_VERIFY=%d\n", g_rx_verify);
+        const char *s = getenv("MINIMIG_ETH_RX_SETTLE_US");
+        if (s && s[0]) {
+            unsigned long us = strtoul(s, 0, 0);
+            if (us > 1000) us = 1000;   // cap: this spins in the RX hot path
+            g_rx_settle_us = (uint32_t)us;
+        }
+        eth_debug("ETH: MINIMIG_ETH_RX_SETTLE_US=%u\n", g_rx_settle_us);
+        const char *p = getenv("MINIMIG_ETH_RX_PACE_US");
+        if (p && p[0]) {
+            unsigned long us = strtoul(p, 0, 0);
+            if (us > 20000) us = 20000;   // cap the busy-spin
+            g_rx_pace_us = (uint32_t)us;
+        }
+        eth_debug("ETH: MINIMIG_ETH_RX_PACE_US=%u\n", g_rx_pace_us);
+        const char *d = getenv("MINIMIG_ETH_RX_DEDUPE_US");
+        if (d && d[0]) {
+            unsigned long us = strtoul(d, 0, 0);
+            if (us > 1000000) us = 1000000;
+            g_rx_dedupe_window_us = (uint32_t)us;
+        }
+        eth_debug("ETH: MINIMIG_ETH_RX_DEDUPE_US=%u\n", g_rx_dedupe_window_us);
+    }
 
     // HPS only initializes its own staging/debug regions. FPGA owns the live
     // NE2000 register mirrors, MAC mirror, and enabled/IRQ/TX flags.
@@ -959,40 +1358,18 @@ void minimig_eth_init()
     }
     eth_debug("ETH: Raw socket opened successfully\n");
     
-    // Find and bind to ethernet interface
-    struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) == -1) {
-        eth_debug("Failed to get interface addresses\n");
-        close(raw_socket);
-        raw_socket = -1;
-        eth_update_shared_status(0xFFFF, 0);
-        return;
-    }
-    
-    bool interface_found = false;
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == NULL) continue;
-        
-        if (ifa->ifa_addr->sa_family == AF_PACKET &&
-            !(ifa->ifa_flags & IFF_LOOPBACK) &&
-            (ifa->ifa_flags & IFF_UP)) {
-            strncpy(bridge_interface, ifa->ifa_name, sizeof(bridge_interface) - 1);
-            bridge_interface[sizeof(bridge_interface) - 1] = '\0';
-            interface_found = true;
-            break;
-        }
-    }
-    freeifaddrs(ifaddr);
-    
-    if (!interface_found) {
+    // Find and bind to a deterministic ethernet interface. The old first-UP
+    // getifaddrs() choice could bind to a bridge/tap/veth layer and receive
+    // duplicate inbound copies that looked legitimate to AF_PACKET.
+    if (!eth_select_bridge_interface(raw_socket)) {
         eth_debug("ETH: Warning: No ethernet interface found for bridging\n");
         close(raw_socket);
         raw_socket = -1;
         eth_update_shared_status(0xFFFF, 0);
         return;
     }
-    eth_debug("ETH: Found ethernet interface: %s\n", bridge_interface);
-    
+    eth_debug("ETH: Selected ethernet interface: %s\n", bridge_interface);
+
     // Get interface index
     struct ifreq ifr;
     strncpy(ifr.ifr_name, bridge_interface, IFNAMSIZ-1);
@@ -1018,6 +1395,17 @@ void minimig_eth_init()
         return;
     }
     eth_debug("ETH: Socket bound to interface successfully\n");
+
+#ifdef PACKET_IGNORE_OUTGOING
+    {
+        int ignore_outgoing = 1;
+        if (setsockopt(raw_socket, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+                       &ignore_outgoing, sizeof(ignore_outgoing)) < 0) {
+            eth_debug("ETH: Warning: PACKET_IGNORE_OUTGOING failed: %s\n",
+                      strerror(errno));
+        }
+    }
+#endif
 
     // Put the bridge interface in promiscuous mode so the host NIC delivers
     // frames addressed to the Amiga's station MAC (which differs from the host
@@ -1133,44 +1521,209 @@ void minimig_eth_reset()
     eth_write_shared_u32(ETH_HPS_HEARTBEAT, hps_heartbeat_counter);
 }
 
-// Verify the IP-header and TCP checksums of a staged outgoing frame exactly as
-// the receiving stack would, to detect a CORRUPTED staged ACK (vs a merely
-// delayed one). Returns true when OK or when the frame is not IPv4/TCP (nothing
-// to check). Observe-only -- never alters the frame or the decision to send.
+static uint16_t eth_frame_byte_sum16(const uint8_t* d, uint16_t len)
+{
+    uint16_t sum = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        sum = (uint16_t)(sum + d[i]);
+    }
+    return sum;
+}
+
+static uint32_t ip_csum_add(const uint8_t* data, uint16_t len, uint32_t sum)
+{
+    uint16_t i = 0;
+
+    for (; i + 1 < len; i += 2) {
+        sum += (uint32_t)((data[i] << 8) | data[i + 1]);
+    }
+    if (i < len) {
+        sum += (uint32_t)(data[i] << 8);
+    }
+
+    return sum;
+}
+
+static bool ip_csum_valid(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)sum == 0xFFFF;
+}
+
+static uint16_t ip_csum_finish(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)(~sum);
+}
+
+static uint32_t ipv4_pseudo_csum(const uint8_t* ip, uint8_t proto, uint16_t len)
+{
+    uint32_t sum = 0;
+
+    sum = ip_csum_add(ip + 12, 8, sum);    // source + destination IPv4
+    sum += proto;
+    sum += len;
+    return sum;
+}
+
+static bool eth_ipv4_l2_offset(const uint8_t* d, size_t len, uint16_t* l2_out)
+{
+    if (len < 14) return false;
+    uint16_t ethertype = (uint16_t)((d[12] << 8) | d[13]);
+    uint16_t l2 = 14;
+
+    if (ethertype == 0x8100 || ethertype == 0x88A8) {         // 802.1Q / 802.1ad
+        if (len < 18) return false;
+        ethertype = (uint16_t)((d[16] << 8) | d[17]);
+        l2 = 18;
+    }
+
+    if (ethertype != 0x0800) return false;
+    *l2_out = l2;
+    return true;
+}
+
+static bool eth_ipv4_is_fragment(const uint8_t* ip)
+{
+    return ((ip[6] & 0x3F) != 0) || (ip[7] != 0);
+}
+
+static bool eth_rx_needs_gso(const uint8_t* d, size_t len)
+{
+    uint16_t l2;
+    if (!eth_ipv4_l2_offset(d, len, &l2)) {
+        return len > 1518;
+    }
+    if (len < (size_t)l2 + 20) {
+        return false;
+    }
+
+    const uint8_t* ip = d + l2;
+    if ((ip[0] >> 4) != 4) return false;
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4);
+    if (ihl < 20 || len < (size_t)l2 + ihl) return false;
+    uint16_t ip_total = (uint16_t)((ip[2] << 8) | ip[3]);
+
+    return (len > (size_t)l2 + ETH_GSO_MTU) ||
+           (ip[9] == 6 && !eth_ipv4_is_fragment(ip) && ip_total > ETH_GSO_MTU);
+}
+
+// Normalize IPv4 header and common L4 checksums in-place. This is deliberately
+// software-only: AF_PACKET send/receive gives us packet bytes, not the skb
+// checksum metadata used by eth0 RX/TX offload. The Amiga must only see and
+// transmit frames whose checksum fields are valid on the wire.
+static bool eth_fix_ipv4_checksums(uint8_t* d, uint16_t len)
+{
+    uint16_t l2;
+    if (!eth_ipv4_l2_offset(d, len, &l2)) return false;
+    if (len < (uint16_t)(l2 + 20)) return false;
+
+    uint8_t* ip = d + l2;
+    if ((ip[0] >> 4) != 4) return false;
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4);
+    if (ihl < 20 || len < (uint16_t)(l2 + ihl)) return false;
+    uint16_t tot = (uint16_t)((ip[2] << 8) | ip[3]);
+    if (tot < ihl || (uint32_t)l2 + tot > len) return false;
+
+    bool changed = false;
+
+    uint16_t old_ip = (uint16_t)((ip[10] << 8) | ip[11]);
+    ip[10] = 0;
+    ip[11] = 0;
+    uint16_t new_ip = ip_csum_finish(ip_csum_add(ip, ihl, 0));
+    ip[10] = (uint8_t)(new_ip >> 8);
+    ip[11] = (uint8_t)new_ip;
+    changed |= (old_ip != new_ip);
+
+    if (eth_ipv4_is_fragment(ip)) return changed;
+
+    uint8_t* l4 = ip + ihl;
+    uint16_t l4_len = (uint16_t)(tot - ihl);
+
+    if (ip[9] == 6) {                                        // TCP
+        if (l4_len < 20) return changed;
+        uint16_t thl = (uint16_t)(((l4[12] >> 4) & 0x0F) * 4);
+        if (thl < 20 || thl > l4_len) return changed;
+        uint16_t old = (uint16_t)((l4[16] << 8) | l4[17]);
+        l4[16] = 0;
+        l4[17] = 0;
+        uint32_t sum = ipv4_pseudo_csum(ip, 6, l4_len);
+        sum = ip_csum_add(l4, l4_len, sum);
+        uint16_t now = ip_csum_finish(sum);
+        l4[16] = (uint8_t)(now >> 8);
+        l4[17] = (uint8_t)now;
+        changed |= (old != now);
+    } else if (ip[9] == 17) {                                // UDP
+        if (l4_len < 8) return changed;
+        uint16_t udp_len = (uint16_t)((l4[4] << 8) | l4[5]);
+        if (udp_len < 8 || udp_len > l4_len) return changed;
+        uint16_t old = (uint16_t)((l4[6] << 8) | l4[7]);
+        l4[6] = 0;
+        l4[7] = 0;
+        uint32_t sum = ipv4_pseudo_csum(ip, 17, udp_len);
+        sum = ip_csum_add(l4, udp_len, sum);
+        uint16_t now = ip_csum_finish(sum);
+        if (now == 0) now = 0xFFFF;                          // UDP zero means "not used"
+        l4[6] = (uint8_t)(now >> 8);
+        l4[7] = (uint8_t)now;
+        changed |= (old != now);
+    } else if (ip[9] == 1) {                                 // ICMP
+        if (l4_len < 4) return changed;
+        uint16_t old = (uint16_t)((l4[2] << 8) | l4[3]);
+        l4[2] = 0;
+        l4[3] = 0;
+        uint16_t now = ip_csum_finish(ip_csum_add(l4, l4_len, 0));
+        l4[2] = (uint8_t)(now >> 8);
+        l4[3] = (uint8_t)now;
+        changed |= (old != now);
+    }
+
+    return changed;
+}
+
+// Verify the IPv4 header and common transport checksums of a staged outgoing
+// frame exactly as the receiver would. This catches corrupt DNS/UDP and ping/ICMP
+// traffic too; the old TCP-only probe let DNS break while txBadCsum stayed zero.
+// Observe-only -- never alters the frame or the decision to send.
 static bool tx_frame_checksums_ok(const uint8_t* d, uint16_t len)
 {
-    if (len < 14 + 20) return true;                          // too short for IP/TCP
-    if (((d[12] << 8) | d[13]) != 0x0800) return true;       // not IPv4
-    const uint8_t* ip = d + 14;
+    uint16_t l2;
+    if (!eth_ipv4_l2_offset(d, len, &l2)) return true;       // not IPv4
+    if (len < (uint16_t)(l2 + 20)) return true;              // too short for IPv4
+    const uint8_t* ip = d + l2;
     uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4);
-    if (ihl < 20 || (uint32_t)14 + ihl > len) return true;   // malformed -> skip
+    if (ihl < 20 || (uint32_t)l2 + ihl > len) return true;   // malformed -> skip
     uint16_t tot = (uint16_t)((ip[2] << 8) | ip[3]);         // IP total length
-    if (tot < ihl || (uint32_t)14 + tot > len) return true;  // length past frame -> skip
+    if (tot < ihl || (uint32_t)l2 + tot > len) return true;  // length past frame -> skip
 
-    // IP header checksum (ones-complement sum over the header == 0xFFFF).
-    uint32_t s = 0;
-    for (uint16_t i = 0; i + 1 < ihl; i += 2)
-        s += (uint32_t)((ip[i] << 8) | ip[i + 1]);
-    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
-    if ((uint16_t)s != 0xFFFF) return false;                 // bad IP checksum
+    if (!ip_csum_valid(ip_csum_add(ip, ihl, 0))) return false;
+    if (eth_ipv4_is_fragment(ip)) return true;
 
-    if (ip[9] != 6) return true;                             // not TCP -> IP-only
+    const uint8_t* l4 = ip + ihl;
+    uint16_t l4_len = (uint16_t)(tot - ihl);
 
-    // TCP checksum: pseudo-header (src/dst IP, proto, TCP length) + segment.
-    const uint8_t* tcp = ip + ihl;
-    uint16_t tcp_len = (uint16_t)(tot - ihl);
-    uint32_t t = 0;
-    t += ((uint32_t)ip[12] << 8) | ip[13];                   // src IP
-    t += ((uint32_t)ip[14] << 8) | ip[15];
-    t += ((uint32_t)ip[16] << 8) | ip[17];                   // dst IP
-    t += ((uint32_t)ip[18] << 8) | ip[19];
-    t += 6;                                                  // protocol
-    t += tcp_len;                                            // TCP length
-    for (uint16_t i = 0; i + 1 < tcp_len; i += 2)
-        t += (uint32_t)((tcp[i] << 8) | tcp[i + 1]);
-    if (tcp_len & 1) t += (uint32_t)(tcp[tcp_len - 1] << 8);  // odd-length pad
-    while (t >> 16) t = (t & 0xFFFF) + (t >> 16);
-    if ((uint16_t)t != 0xFFFF) return false;                 // bad TCP checksum
+    if (ip[9] == 6) {                                        // TCP
+        if (l4_len < 20) return true;                        // malformed -> skip
+        uint32_t sum = ipv4_pseudo_csum(ip, 6, l4_len);
+        sum = ip_csum_add(l4, l4_len, sum);
+        if (!ip_csum_valid(sum)) return false;
+    } else if (ip[9] == 17) {                                // UDP
+        if (l4_len < 8) return true;                         // malformed -> skip
+        uint16_t udp_len = (uint16_t)((l4[4] << 8) | l4[5]);
+        uint16_t udp_sum = (uint16_t)((l4[6] << 8) | l4[7]);
+        if (udp_sum == 0) return true;                       // optional in IPv4
+        if (udp_len < 8 || udp_len > l4_len) return true;    // malformed -> skip
+        uint32_t sum = ipv4_pseudo_csum(ip, 17, udp_len);
+        sum = ip_csum_add(l4, udp_len, sum);
+        if (!ip_csum_valid(sum)) return false;
+    } else if (ip[9] == 1) {                                 // ICMP
+        if (l4_len < 4) return true;                         // malformed -> skip
+        if (!ip_csum_valid(ip_csum_add(l4, l4_len, 0))) return false;
+    }
     return true;
 }
 
@@ -1277,21 +1830,23 @@ static bool transmit_packet(const struct tx_request* request)
     }
     // Split retx cause: dup-ACKs from the Amiga mean a missing in-bound segment.
     tcp_track_outgoing_ack(packet_data, length);
-    // DIAGNOSTIC: is the staged frame (usually an ACK) actually well-formed? A bad
-    // IP/TCP checksum here = the FPGA staged corrupt content -> the peer drops it
-    // and keeps retransmitting (retx/retxAck/retxDat) with no other counter firing.
-    if (!tx_frame_checksums_ok(packet_data, length)) {
+    // DIAGNOSTIC: is the staged frame (usually an ACK) well-formed before HPS
+    // normalization? If not, count it, but still repair the copy below before
+    // AF_PACKET send so eth0 TX checksum offload state cannot decide correctness.
+    bool tx_staged_csum_ok = tx_frame_checksums_ok(packet_data, length);
+    if (!tx_staged_csum_ok) {
         g_perf_tx_bad_csum++;
         static int csum_dumped = 0;
         if (csum_dumped < 6) {
             csum_dumped++;
-            eth_debug("ETH: TX BAD CSUM #%llu seq=%u len=%u first40:",
+            eth_debug("ETH: TX staged bad checksum #%llu seq=%u len=%u first40:",
                       (unsigned long long)g_perf_tx_bad_csum, request->seq, length);
             for (int i = 0; i < 40 && i < length; i++)
                 eth_debug(" %02X", packet_data[i]);
             eth_debug("\n");
         }
     }
+    uint16_t tx_hps_frame_sum = eth_frame_byte_sum16(packet_data, length);
     // Pace the download: clamp the advertised TCP window on the COPY we send to
     // the server (the observations above used the Amiga's unmodified frame).
     uint8_t tx_send_buf[ETH_PACKET_BUFFER_SIZE];
@@ -1299,7 +1854,16 @@ static bool transmit_packet(const struct tx_request* request)
     if (length <= ETH_PACKET_BUFFER_SIZE) {
         memcpy(tx_send_buf, packet_data, length);
         if (tx_clamp_window(tx_send_buf, length)) g_perf_tx_win_clamped++;
+        if (eth_fix_ipv4_checksums(tx_send_buf, length)) g_perf_tx_csum_fix++;
         tx_out = tx_send_buf;
+    }
+    if (!tx_frame_checksums_ok(tx_out, length)) {
+        eth_debug("ETH: refusing TX frame with invalid checksum after software normalization, seq=%u len=%u\n",
+                  request->seq, length);
+        state.tx_errors++;
+        g_perf_tx_drop++;
+        write_eth_state_stats(&state);
+        return false;
     }
     ssize_t sent = send(raw_socket, tx_out, length, 0);
     if (sent < 0) {
@@ -1315,6 +1879,9 @@ static bool transmit_packet(const struct tx_request* request)
         write_eth_state_stats(&state);
         return false;
     } else {
+        g_tx_hps_csum_run = (uint16_t)(g_tx_hps_csum_run + tx_hps_frame_sum);
+        g_tx_hps_byte_count = (uint16_t)(g_tx_hps_byte_count + length);
+        g_tx_hps_frame_count = (uint16_t)(g_tx_hps_frame_count + 1);
         eth_trace("ETH: Transmitted packet of %d bytes (total TX: %d)\n", length, state.tx_packets + 1);
         state.tx_packets++;
     }
@@ -1416,11 +1983,28 @@ void receive_packet()
     }
 
     for (;;) {
-        uint8_t buffer[ETH_PACKET_BUFFER_SIZE];
-        ssize_t len = recv(raw_socket, buffer, sizeof(buffer), 0);
+        // Large enough to hold a fully GRO/LRO-coalesced superframe so software GSO
+        // can re-split it below. recv() returns the full frame (no MSG_TRUNC needed,
+        // the buffer exceeds the kernel gso_max). static: one reused scratch buffer,
+        // off the stack (the daemon polls single-threaded).
+        static uint8_t buffer[ETH_RX_JUMBO_SIZE];
+        struct sockaddr_ll from;
+        socklen_t from_len = sizeof(from);
+        ssize_t len = recvfrom(raw_socket, buffer, sizeof(buffer), 0,
+                               (struct sockaddr*)&from, &from_len);
 
         if (len <= 0) {
             break;
+        }
+
+        if (from_len >= sizeof(from) &&
+            (from.sll_pkttype == PACKET_OUTGOING
+#ifdef PACKET_LOOPBACK
+             || from.sll_pkttype == PACKET_LOOPBACK
+#endif
+            )) {
+            g_perf_rx_echo_drop++;
+            continue;
         }
 
         // Filter out non-ethernet frames.
@@ -1428,14 +2012,15 @@ void receive_packet()
             continue;
         }
 
-        if (len > ETH_PACKET_BUFFER_SIZE) {
-            eth_debug("ETH: Dropping oversized RX packet (%zd bytes)\n", len);
-            state.rx_errors++;
-            continue;
-        }
-
-        if ((len < 60) && !(rcr & NE_RCR_AR)) {
-            continue;
+        // AF_PACKET often presents valid Ethernet frames with the wire padding
+        // stripped (ARP, TCP SYN/ACK/FIN/ACK, small UDP/DNS). A real RTL8019 sees
+        // those as legal minimum-size frames, not runts. Re-pad before applying
+        // NE2000 filtering/delivery so small control traffic is not silently
+        // choked while larger ping/data packets keep working.
+        if (len < 60) {
+            memset(buffer + len, 0, (size_t)(60 - len));
+            len = 60;
+            g_perf_rx_padded++;
         }
 
         // Respect the RTL8019 receive filter so we don't queue the whole LAN.
@@ -1466,35 +2051,46 @@ void receive_packet()
             continue;
         }
 
+        if (eth_rx_is_near_duplicate(buffer, (size_t)len)) {
+            g_perf_rx_dup_drop++;
+            continue;
+        }
+
+        // Host RX offload can hand an AF_PACKET socket a GRO/LRO coalesced TCP
+        // superframe instead of wire-sized Ethernet frames. A real RTL8029/X-Surf
+        // never sees that. Split by either captured L2 length OR IPv4 total length,
+        // because some GRO paths leave IP total-length stale while appending the
+        // coalesced payload bytes to the skb.
+        if (eth_rx_needs_gso(buffer, (size_t)len)) {
+            struct eth_gso_deliver_ctx dctx = { &flags, &state };
+            int nseg = eth_gso_resegment(buffer, (int)len, eth_gso_deliver_seg, &dctx);
+            if (nseg > 0) {
+                g_perf_rx_seg += (uint64_t)nseg;
+            } else {
+                // Not an in-order IPv4/TCP data superframe (jumbo, non-TCP, fragment,
+                // SYN/RST): cannot be delivered intact -> drop (TCP retransmits).
+                g_perf_rx_oversize++;
+                eth_debug("ETH: dropping unsegmentable oversized RX frame (%zd bytes)\n", len);
+                state.rx_errors++;
+            }
+            continue;
+        }
+
+        if (len > ETH_PACKET_BUFFER_SIZE) {
+            g_perf_rx_oversize++;
+            eth_debug("ETH: dropping oversized non-GSO RX frame (%zd bytes)\n", len);
+            state.rx_errors++;
+            continue;
+        }
+
         uint16_t packet_len = (uint16_t)len;
+        if (eth_fix_ipv4_checksums(buffer, packet_len)) g_perf_rx_csum_fix++;
 
         // Ground-truth RX loss measurement: count server retransmits on the
         // download stream (see tcp_track_download). Done on every accepted
         // frame; non-TCP / pure-ACK frames are ignored inside the helper.
         tcp_track_download(buffer, packet_len);
-
-        // Strict FIFO across the shm + host queues. Drain anything already
-        // deferred into shm first, and only fast-path THIS frame straight to shm
-        // when nothing is waiting ahead of it. Without this, once a burst fills
-        // shm and a frame is deferred to the host queue, the very next frame can
-        // find a freed shm slot and OVERTAKE the deferred one -> out-of-order
-        // delivery to the Amiga -> dup-ACKs -> TCP fast-retransmit/cwnd collapse
-        // (observed as dupAck>0 with retx~0 and stalled/aborted downloads).
-        while (pump_host_rx_queue(&flags, &state)) {
-        }
-        bool queued = (host_rx_queue_count == 0) &&
-                      enqueue_shared_rx_packet(buffer, packet_len, &flags, &state);
-        if (!queued) {
-            if (!enqueue_host_rx_packet(buffer, packet_len)) {
-                g_perf_rx_drop++;
-                eth_debug("ETH: RX software queue full, dropping packet of %u bytes\n", packet_len);
-                state.rx_errors++;
-            } else {
-                g_perf_rx_defer++;
-                eth_debug("ETH: Deferred RX packet of %u bytes in host queue (depth: %u)\n",
-                          packet_len, host_rx_queue_count);
-            }
-        }
+        deliver_rx_frame(buffer, packet_len, &flags, &state);
 
 #ifdef ETH_TRACE
         // Per-frame trace (off by default): first 32 bytes of received packet.
@@ -1587,42 +2183,113 @@ void minimig_eth_poll()
                         sock_drops = pst.tp_drops;
                     }
                 }
-                // Integrity-probe compare -- only after TWO consecutive fully-idle
-                // intervals (no RX in flight, shm + host queues empty). One idle
-                // interval isn't enough: the daemon bumps g_sent_csum_run the moment
-                // it ENQUEUES a frame, but the bg updates its slot-40 sum later when
-                // it WRITES the ring, and those two events straddle the 1s ETHPERF
-                // boundary -- so on a single idle sample the diff can wobble purely
-                // from that settle-lag and get miscounted as "bad". Requiring a
-                // second consecutive idle interval guarantees the bg has caught up,
-                // so a diff CHANGE then reflects a real shm->ring delivery mismatch.
-                // bg slot-40 csum (0x110A) is byte-swapped vs ours.
+                // Integrity-probe compare (count-tagged). The bg publishes a running
+                // byte-sum of payload it wrote into the ring (slot 40, 0x110A) and a
+                // count of frames delivered (slot 41, 0x110C); both are byte-swapped
+                // by the mailbox. We hold the same running sum + count for frames we
+                // enqueued. Compare the sums ONLY when the bg's count equals ours and
+                // is STABLE across the read (re-read the count): that means the bg has
+                // delivered exactly the frames we sent, so the sums cover the identical
+                // frame set and an inequality is a genuine shm->ring (bg write)
+                // corruption -- not the reset/origin offset that made the old idle-only
+                // probe untrustworthy. This fires at the frequent drain points during a
+                // download, so it reports DURING the loss, not only at full idle.
                 {
-                    uint16_t hd = read_shared_rx_queue_head();
-                    uint16_t tl = read_shared_rx_queue_tail();
-                    static int idle_run = 0;
-                    if (rxf < 1.0 && hd == tl && host_rx_queue_count == 0) {
-                        idle_run++;
-                        if (idle_run >= 2) {
-                            uint16_t raw = eth_read_shared_u16(0x110A);
-                            uint16_t bg_csum = (uint16_t)((raw << 8) | (raw >> 8));
-                            uint16_t diff = (uint16_t)(bg_csum - (uint16_t)g_sent_csum_run);
-                            static int have_diff = 0; static uint16_t last_diff = 0;
-                            if (have_diff && diff != last_diff) g_perf_deliv_bad++;
-                            last_diff = diff; have_diff = 1;
+                    uint16_t c1   = (uint16_t)0; uint16_t c2 = (uint16_t)0; uint16_t bgcs = (uint16_t)0;
+                    { uint16_t r = eth_read_shared_u16(ETH_RTL8019_RX_FRAMES); c1   = (uint16_t)((r << 8) | (r >> 8)); }
+                    { uint16_t r = eth_read_shared_u16(ETH_RTL8019_RX_CSUM);   bgcs = (uint16_t)((r << 8) | (r >> 8)); }
+                    { uint16_t r = eth_read_shared_u16(ETH_RTL8019_RX_FRAMES); c2   = (uint16_t)((r << 8) | (r >> 8)); }
+                    g_perf_csum_bg = bgcs; g_perf_cnt_bg = c1;
+                    if (!g_csum_calibrated) {
+                        // Origin-align once: adopt the bg's current count+sum so frames
+                        // enqueued from here advance both sides in lockstep (covers a
+                        // daemon that (re)started after the FPGA was already running).
+                        g_sent_frame_count = c1; g_sent_csum_run = bgcs; g_csum_calibrated = 1;
+                    } else if (c1 == c2 && c1 == g_sent_frame_count) {
+                        // Caught up and stable: the sums must be equal if the FPGA
+                        // delivered our bytes intact.
+                        uint16_t delta = (uint16_t)(bgcs - (uint16_t)g_sent_csum_run);
+                        static int prev_bad = 0; static uint16_t prev_delta = 0, counted_delta = 0;
+                        if (delta != 0) {
+                            // Debounce the <=1-sweep skew between the csum and count
+                            // slots: only count a divergence still present (same delta)
+                            // on a later caught-up sample, and only once per NEW delta.
+                            if (prev_bad && delta == prev_delta && delta != counted_delta) {
+                                g_perf_deliv_bad++;
+                                counted_delta = delta;
+                                if (g_perf_deliv_bad_frame == 0) g_perf_deliv_bad_frame = c1;
+                            }
+                            prev_bad = 1; prev_delta = delta;
+                        } else {
+                            prev_bad = 0;
                         }
+                    } else if (c1 == c2 && c1 != g_sent_frame_count) {
+                        // Counts diverged -> a frame was dropped (separately flagged by
+                        // ovwDrop/sockDrop/defer). Re-baseline so the probe keeps working.
+                        g_sent_frame_count = c1; g_sent_csum_run = bgcs;
+                    }
+                }
+                // Read-side probe: ringWr (bytes the bg WROTE into the ring) vs dpRd
+                // (bytes the 68k READ back via the data port). At RX idle the 68k has
+                // read every written frame, so the two totals match iff it reads the
+                // ring intact. A persistent (stable across two idle samples) nonzero
+                // delta => the 68k pulls different bytes than the bg wrote = a data-
+                // port READ corruption (RTL-fixable). Equal => 68k reads correctly =>
+                // the loss is Amiga-side. (The raw ringWr/dpRd are printed so a benign
+                // constant offset, e.g. a header re-read, can be told from corruption.)
+                {
+                    uint16_t rw = eth_read_shared_u16(ETH_RTL8019_RING_WR);
+                    uint16_t rd = eth_read_shared_u16(ETH_RTL8019_DP_RD);
+                    uint16_t rc = eth_read_shared_u16(ETH_RTL8019_RD_CORRUPT);
+                    uint16_t rk = eth_read_shared_u16(ETH_RTL8019_RD_CHECKED);
+                    uint16_t rb = eth_read_shared_u16(ETH_RTL8019_RB_BAD);
+                    uint16_t rs = eth_read_shared_u16(ETH_RTL8019_RB_CSUM_RUN);
+                    uint16_t re = eth_read_shared_u16(ETH_RTL8019_RD_BAD_EXP);
+                    uint16_t ra = eth_read_shared_u16(ETH_RTL8019_RD_BAD_ACT);
+                    uint16_t tm = eth_read_shared_u16(ETH_RTL8019_TX_MIRROR_CSUM);
+                    uint16_t tf = eth_read_shared_u16(ETH_RTL8019_TX_MIRROR_FRAMES);
+                    uint16_t td = eth_read_shared_u16(ETH_RTL8019_TX_DRAIN_CSUM);
+                    uint16_t tn = eth_read_shared_u16(ETH_RTL8019_TX_DRAIN_FRAMES);
+                    uint16_t tb = eth_read_shared_u16(ETH_RTL8019_TX_MIRROR_BYTES);
+                    uint16_t ty = eth_read_shared_u16(ETH_RTL8019_TX_DRAIN_BYTES);
+                    g_perf_ring_wr = (uint16_t)((rw << 8) | (rw >> 8));
+                    g_perf_dp_rd   = (uint16_t)((rd << 8) | (rd >> 8));
+                    g_perf_rd_corrupt = (uint16_t)((rc << 8) | (rc >> 8));
+                    g_perf_rd_checked = (uint16_t)((rk << 8) | (rk >> 8));
+                    // WRITE/storage read-back probe (slots 46/47, shm 0x1116/0x1118,
+                    // byte-swapped like the other slot reads above).
+                    g_perf_rb_bad      = (uint16_t)((rb << 8) | (rb >> 8));
+                    g_perf_rb_csum_run = (uint16_t)((rs << 8) | (rs >> 8));
+                    g_perf_rd_bad_exp  = (uint16_t)((re << 8) | (re >> 8));
+                    g_perf_rd_bad_act  = (uint16_t)((ra << 8) | (ra >> 8));
+                    g_perf_tx_mirror_csum   = (uint16_t)((tm << 8) | (tm >> 8));
+                    g_perf_tx_mirror_frames = (uint16_t)((tf << 8) | (tf >> 8));
+                    g_perf_tx_drain_csum    = (uint16_t)((td << 8) | (td >> 8));
+                    g_perf_tx_drain_frames  = (uint16_t)((tn << 8) | (tn >> 8));
+                    g_perf_tx_mirror_bytes  = (uint16_t)((tb << 8) | (tb >> 8));
+                    g_perf_tx_drain_bytes   = (uint16_t)((ty << 8) | (ty >> 8));
+                    static int rd_idle = 0; static uint16_t prev_d = 0; static int have_d = 0;
+                    if (rxf < 1.0 && host_rx_queue_count == 0) {
+                        rd_idle++;
+                        uint16_t d = (uint16_t)(g_perf_ring_wr - g_perf_dp_rd);
+                        if (rd_idle >= 2 && d != 0 && have_d && d == prev_d) g_perf_rd_bad++;
+                        prev_d = d; have_d = 1;
                     } else {
-                        idle_run = 0;
+                        rd_idle = 0;
                     }
                 }
                 static uint64_t p_tm = 0, p_retx = 0, p_da = 0, p_gap = 0, p_txd = 0;
                 eth_perf("ETHPERF: RX %.0f fps %.1f KB/s | TX %.0f fps %.1f KB/s | "
                          "amigaWin min=%ld last=%u zeroWin=%llu/s txMiss=%llu/s txDrop=%llu/s "
-                         "retx=%llu/s dupAck=%llu/s rxGap=%llu/s delivBad=%llu retxAck=%llu retxDat=%llu txBadCsum=%llu | "
+                         "retx=%llu/s dupAck=%llu/s rxGap=%llu/s delivBad=%llu retxAck=%llu retxDat=%llu txBadCsum=%llu txCsumFix=%llu | "
                          "sockDrop %u sockPkts %u | "
                          "ovwDrop %u/s ringCURR=0x%02X BNRY=0x%02X | "
                          "bcastDrop %.0f/s defer %llu drop %llu hostQ %u | "
-                         "recvMaxUs=%llu recvFrMax=%llu copyMaxUs=%llu winClamp=%llu | poll %.0f/s\n",
+                         "recvMaxUs=%llu recvFrMax=%llu copyMaxUs=%llu winClamp=%llu rxOversz=%llu rxSeg=%llu rxCsumFix=%llu rxPad=%llu rxEcho=%llu rxDup=%llu | "
+                         "csBG=0x%04X csTX=0x%04X cnBG=%u cnTX=%u badFrm=%u wrBad=%llu rbBad=%u rbCs=0x%04X | "
+                         "ringWr=0x%04X dpRd=0x%04X rdBad=%llu rdCorrupt=%u/%u "
+                         "rdLast exp=0x%04X got=0x%04X | "
+                         "txPath M=%04X/%u/%u D=%04X/%u/%u H=%04X/%u/%u | poll %.0f/s\n",
                          rxf, rxk, txf, txk,
                          amiga_win_min, (unsigned)g_perf_tx_win_last,
                          (unsigned long long)(g_perf_tx_zerowin - p_zw),
@@ -1635,6 +2302,7 @@ void minimig_eth_poll()
                          (unsigned long long)g_perf_retx_ack,
                          (unsigned long long)g_perf_retx_dat,
                          (unsigned long long)g_perf_tx_bad_csum,
+                         (unsigned long long)g_perf_tx_csum_fix,
                          sock_drops, sock_pkts,
                          (unsigned)ovw_delta, (unsigned)curr, (unsigned)bnry, bcd,
                          (unsigned long long)(g_perf_rx_defer - p_df),
@@ -1644,6 +2312,31 @@ void minimig_eth_poll()
                          (unsigned long long)g_perf_recv_frames_max,
                          (unsigned long long)g_perf_rx_copy_us_max,
                          (unsigned long long)g_perf_tx_win_clamped,
+                         (unsigned long long)g_perf_rx_oversize,
+                         (unsigned long long)g_perf_rx_seg,
+                         (unsigned long long)g_perf_rx_csum_fix,
+                         (unsigned long long)g_perf_rx_padded,
+                         (unsigned long long)g_perf_rx_echo_drop,
+                         (unsigned long long)g_perf_rx_dup_drop,
+                         (unsigned)g_perf_csum_bg, (unsigned)(g_sent_csum_run & 0xFFFF),
+                         (unsigned)g_perf_cnt_bg, (unsigned)g_sent_frame_count,
+                         (unsigned)g_perf_deliv_bad_frame,
+                         (unsigned long long)g_perf_wr_bad,
+                         (unsigned)g_perf_rb_bad, (unsigned)g_perf_rb_csum_run,
+                         (unsigned)g_perf_ring_wr, (unsigned)g_perf_dp_rd,
+                         (unsigned long long)g_perf_rd_bad,
+                         (unsigned)g_perf_rd_corrupt, (unsigned)g_perf_rd_checked,
+                         (unsigned)g_perf_rd_bad_exp,
+                         (unsigned)g_perf_rd_bad_act,
+                         (unsigned)g_perf_tx_mirror_csum,
+                         (unsigned)g_perf_tx_mirror_frames,
+                         (unsigned)g_perf_tx_mirror_bytes,
+                         (unsigned)g_perf_tx_drain_csum,
+                         (unsigned)g_perf_tx_drain_frames,
+                         (unsigned)g_perf_tx_drain_bytes,
+                         (unsigned)g_tx_hps_csum_run,
+                         (unsigned)g_tx_hps_frame_count,
+                         (unsigned)g_tx_hps_byte_count,
                          pls);
                 p_rxf = g_perf_rx_frames; p_rxb = g_perf_rx_bytes;
                 p_txf = g_perf_tx_frames; p_txb = g_perf_tx_bytes;
@@ -1694,6 +2387,9 @@ void minimig_eth_poll()
                    poll_count, flags, status, enabled, rx_active, cr_reg, rcr_reg, isr_reg, imr_reg, raw_cr_word,
                    curr_reg, bnry_reg, state.current_page, state.tx_packets, state.rx_packets,
                    tx_request_seq, tx_complete_seq, hps_heartbeat_counter);
+            (void)cr_reg; (void)curr_reg; (void)bnry_reg; (void)rcr_reg;
+            (void)isr_reg; (void)imr_reg; (void)raw_cr_word;
+            (void)tx_complete_seq; (void)enabled; (void)rx_active;
             //minimig_eth_test();
         }
         
@@ -1771,6 +2467,7 @@ void minimig_eth_test()
         read_eth_state(&state);
 
         eth_debug("ETH TEST: destructive shared-memory pattern mode is disabled.\n");
+        (void)shared_mac; (void)flags; (void)state;
         eth_debug("  Flags: 0x%08X\n", flags);
         eth_debug("  MAC:   %02X:%02X:%02X:%02X:%02X:%02X\n",
                shared_mac[0], shared_mac[1], shared_mac[2],
@@ -2052,6 +2749,7 @@ void minimig_eth_test()
     uint8_t isr_reg = eth_read_shared_reg(ETH_CTRL_REGS + (0x07 * 4));
     eth_debug("  CR  (0x00) = 0x%02X (pattern: 0x%08X)\n", cr_reg, 0x02000000 | ETH_CTRL_REGS);
     eth_debug("  ISR (0x07) = 0x%02X (pattern: 0x%08X)\n", isr_reg, 0x02070000 | (ETH_CTRL_REGS + 0x1C));
+    (void)cr_reg; (void)isr_reg;
     
     // Read MAC address from shared memory
     uint8_t shared_mac[6];
@@ -2067,6 +2765,7 @@ void minimig_eth_test()
     eth_debug("  - Reset:    %s\n", (flags & ETH_FLAG_RESET) ? "YES" : "NO");
     eth_debug("  - TX Req:   %s\n", (flags & ETH_FLAG_TX_REQ) ? "YES" : "NO");
     eth_debug("  - RX Avail: %s\n", (flags & ETH_FLAG_RX_AVAIL) ? "YES" : "NO");
+    (void)flags;
     eth_debug("  - IRQ:      %s\n", (flags & ETH_FLAG_IRQ) ? "YES" : "NO");
     eth_debug("  - Enabled:  %s\n", (flags & ETH_FLAG_ENABLED) ? "YES" : "NO");
     
