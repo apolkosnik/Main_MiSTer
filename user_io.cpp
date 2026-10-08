@@ -42,6 +42,8 @@
 #include "frame_timer.h"
 #include "scaler.h"
 #include "support.h"
+#include "support/falcon/falcon_nvram.h"
+#include "support/falcon/falcon_config.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -1540,6 +1542,7 @@ void user_io_init(const char *path, const char *xml)
 
 	user_io_read_confstr();
 	user_io_read_core_name();
+	if (is_falcon()) falcon_config_init();
 
 	if ((fpga_get_buttons() & BUTTON_OSD) && is_menu())
 	{
@@ -1679,12 +1682,17 @@ void user_io_init(const char *path, const char *xml)
 				{
 					atari5200_init();
 				}
+				else if (is_falcon() && falcon_config_boot())
+				{
+					// Startup profile loaded its options, NVRAM, ROM and media.
+				}
 				else
 				{
 					const char *home = HomeDir();
 
 					if (is_uneon()) x86_ide_set();
 					if (is_cdi()) cdi_load_root_nvram();
+					if (is_falcon()) falcon_nvram_load();
 					if (is_marty()) marty_init();
 					if (is_pcfx()) pcfx_init();
 
@@ -2402,6 +2410,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 
 	// notify core of possible sd image change
 	spi_uio_cmd8(UIO_SET_SDSTAT, (1 << index) | (writable ? 0 : 0x80));
+	if (is_falcon()) falcon_config_record_disk(index, ret ? name : "");
 	return ret ? 1 : 0;
 }
 
@@ -3088,6 +3097,7 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
 	}
 
 	mdplus_init(name); // MD+ CDDA init
+	if (is_falcon()) falcon_config_record_rom(index, name, composite);
 
 	return 1;
 }
@@ -4059,6 +4069,7 @@ void user_io_poll()
 	if (is_marty()) marty_poll();
 	if (is_pcfx()) pcfx_poll();
 	if (is_cdi()) cdi_poll();
+	if (is_falcon()) falcon_nvram_poll();
 	if (is_psx()) psx_poll();
 	if (is_neogeo_cd()) neocd_poll();
 	if (is_n64()) n64_poll();

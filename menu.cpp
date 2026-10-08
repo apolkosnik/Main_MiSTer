@@ -63,6 +63,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "joymapping.h"
 #include "recent.h"
 #include "support.h"
+#include "support/falcon/falcon_config.h"
 #include "bootcore.h"
 #include "ide.h"
 #include "profiling.h"
@@ -197,6 +198,15 @@ enum MENU
 	MENU_MINIMIG_SAVECONFIG2,
 	MENU_MINIMIG_PRESET1,
 	MENU_MINIMIG_PRESET2,
+
+	// Falcon (keep render/input states adjacent)
+	MENU_FALCON_MAIN1,
+	MENU_FALCON_MAIN2,
+	MENU_FALCON_FDD_SELECTED,
+	MENU_FALCON_LOAD_CONFIG1,
+	MENU_FALCON_LOAD_CONFIG2,
+	MENU_FALCON_SAVE_CONFIG1,
+	MENU_FALCON_SAVE_CONFIG2,
 
 	// Atari ST
 	MENU_ST_MAIN1,
@@ -1651,6 +1661,7 @@ void HandleUI(void)
 			{
 				menustate = MENU_CORES1;
 			}
+			else if (is_falcon() && mgl->done) menustate = MENU_FALCON_MAIN1;
 			else if (saved_menustate)
 			{
 				menustate = saved_menustate;
@@ -2012,7 +2023,7 @@ void HandleUI(void)
 			uint32_t selentry = 0;
 			menumask = 0;
 
-			OsdSetTitle(page ? title : user_io_get_core_name());
+			OsdSetTitle(page ? title : is_falcon() ? "Modify config" : user_io_get_core_name());
 
 			dip_submenu = -1;
 			manual_submenu = -1;
@@ -2127,7 +2138,15 @@ void HandleUI(void)
 							int num = (p[idx] >= '0' && p[idx] <= '9') ? p[idx] - '0' : 0;
 							if (!mgl->done && num == mgl->item[mgl->current].index && (p[0] == mgl->item[mgl->current].type)) mgl->item[mgl->current].submenu = selentry;
 
-							if ((is_x86() || (is_pcat286() && p[0] == 'S')) &&
+							if (is_falcon())
+							{
+								const char *path = p[0] == 'F' ? falcon_config_rom(num) : falcon_config_disk(num);
+								const char *name = strrchr(path, '/');
+								char label[128];
+								substrcpy(label, p, 2);
+								snprintf(s, sizeof(s), " %s %s", label, path[0] ? (name ? name + 1 : path) : "<empty>");
+							}
+							else if ((is_x86() || (is_pcat286() && p[0] == 'S')) &&
 								x86_get_image_name(num))
 							{
 								strcpy(s, " ");
@@ -2306,7 +2325,7 @@ void HandleUI(void)
 			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
 
 			// exit row
-			if (!page)
+			if (!page && !is_falcon())
 			{
 				MenuWrite(entry, STD_EXIT, menusub == selentry, 0, OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
 			}
@@ -2389,7 +2408,7 @@ void HandleUI(void)
 		break;
 
 	case MENU_GENERIC_MAIN3:
-		saved_menustate = MENU_GENERIC_MAIN1;
+		saved_menustate = is_falcon() && mgl->done ? MENU_FALCON_MAIN1 : MENU_GENERIC_MAIN1;
 
 		// F/S option not found -> deactivate mgl.
 		if (!mgl->done && mgl->item[mgl->current].submenu < 0)
@@ -2402,9 +2421,13 @@ void HandleUI(void)
 		{
 			menustate = MENU_NONE1;
 		}
-		else if(back || (left && page) || (menusub == menusub_last && select))
+		else if(back || (left && (page || is_falcon())) || (menusub == menusub_last && select))
 		{
-			if(!page) menustate = MENU_NONE1;
+			if (!page)
+			{
+				menustate = is_falcon() ? MENU_FALCON_MAIN1 : MENU_NONE1;
+				if (is_falcon()) menusub = 2;
+			}
 			else
 			{
 				firstmenu = 0;
@@ -3248,6 +3271,11 @@ void HandleUI(void)
 				{
 					menusub = 0;
 					menustate = MENU_ST_MAIN1;
+				}
+				else if (is_falcon())
+				{
+					menusub = 0;
+					menustate = MENU_FALCON_MAIN1;
 				}
 				else
 				{
@@ -4246,6 +4274,11 @@ void HandleUI(void)
 					menusub = 0;
 					menustate = MENU_ST_MAIN1;
 				}
+				else if (is_falcon())
+				{
+					menusub = 0;
+					menustate = MENU_FALCON_MAIN1;
+				}
 				else
 				{
 					menusub = 0;
@@ -4721,6 +4754,177 @@ void HandleUI(void)
 		/******************************************************************/
 		/* st main menu                                                 */
 		/******************************************************************/
+
+	case MENU_FALCON_MAIN1:
+		OsdSetSize(16);
+		OsdSetTitle("Falcon", 0);
+		helptext_idx = 0;
+		menumask = 0x3FF;
+		firstmenu = 0;
+		page = 0;
+		m = 0;
+		for (unsigned i = 0; i < 2; ++i)
+		{
+			const char *path = falcon_config_disk(i);
+			const char *name = strrchr(path, '/');
+			snprintf(s, 29, " %c: %s", 'A' + i, path[0] ? (name ? name + 1 : path) : "<empty>");
+			OsdWrite(m++, s, menusub == i);
+		}
+		OsdWrite(m++);
+		OsdWrite(m++, " Modify config             \x16", menusub == 2);
+		OsdWrite(m++, " Load config               \x16", menusub == 3);
+		OsdWrite(m++, " Save config               \x16", menusub == 4);
+		OsdWrite(m++);
+		snprintf(s, 29, " Joysticks swap: %s", user_io_get_joyswap() ? "Yes" : "No");
+		OsdWrite(m++, s, menusub == 5);
+		OsdWrite(m++);
+		OsdWrite(m++, " Reset", menusub == 6);
+		OsdWrite(m++, " Cold Boot", menusub == 7);
+		OsdWrite(m++, " Reset NVRAM", menusub == 8);
+		for (; m < 15; ++m) OsdWrite(m);
+		OsdWrite(15, STD_EXIT, menusub == 9, 0, OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
+		parentstate = MENU_FALCON_MAIN1;
+		menustate = MENU_FALCON_MAIN2;
+		break;
+
+	case MENU_FALCON_MAIN2:
+		if (menu || back) menustate = MENU_NONE1;
+		else if (right)
+		{
+			menustate = MENU_COMMON1;
+			menusub = 0;
+		}
+		else if (left)
+		{
+			menustate = MENU_MISC1;
+			menusub = 3;
+		}
+		else if (menusub < 2 && (select || recent))
+		{
+			if (falcon_config_disk(menusub)[0])
+			{
+				user_io_set_index(menusub);
+				user_io_file_mount("", menusub);
+				menustate = MENU_FALCON_MAIN1;
+			}
+			else
+			{
+				fs_Options = SCANO_DIR;
+				fs_MenuSelect = MENU_FALCON_FDD_SELECTED;
+				fs_MenuCancel = MENU_FALCON_MAIN1;
+				strcpy(fs_pFileExt, "ST ");
+				if (select) SelectFile(Selected_S[menusub], fs_pFileExt, fs_Options, fs_MenuSelect, fs_MenuCancel, menusub + 500);
+				else if (recent_init(menusub + 500)) menustate = MENU_RECENT1;
+			}
+		}
+		else if (select)
+		{
+			switch (menusub)
+			{
+			case 2:
+				menustate = MENU_GENERIC_MAIN1;
+				menusub = 0;
+				page = 0;
+				firstmenu = 0;
+				break;
+			case 3:
+				menustate = MENU_FALCON_LOAD_CONFIG1;
+				menusub = 0;
+				break;
+			case 4:
+				menustate = MENU_FALCON_SAVE_CONFIG1;
+				menusub = 0;
+				break;
+			case 5:
+				user_io_set_joyswap(!user_io_get_joyswap());
+				menustate = MENU_FALCON_MAIN1;
+				break;
+			case 6:
+			case 7:
+			case 8:
+				{
+					const char *option = menusub == 6 ? "[0]" : menusub == 7 ? "[7]" : "[8]";
+					user_io_status_set(option, 1);
+					user_io_status_set(option, 0);
+					menustate = MENU_NONE1;
+				}
+				break;
+			case 9:
+				menustate = MENU_NONE1;
+				break;
+			}
+		}
+		break;
+
+	case MENU_FALCON_FDD_SELECTED:
+		user_io_set_index(menusub);
+		if (user_io_file_mount(selPath, menusub))
+		{
+			recent_update(SelectedDir, selPath, SelectedLabel, menusub + 500);
+			menustate = MENU_FALCON_MAIN1;
+		}
+		else
+		{
+			MenuHide();
+			Info("Cannot mount floppy image", 5000);
+		}
+		break;
+
+	case MENU_FALCON_LOAD_CONFIG1:
+	case MENU_FALCON_SAVE_CONFIG1:
+		{
+			bool save = menustate == MENU_FALCON_SAVE_CONFIG1;
+			OsdSetSize(16);
+			OsdSetTitle(save ? "Save Config" : "Load Config", 0);
+			helptext_idx = 0;
+			firstmenu = 0;
+			parentstate = menustate;
+			menumask = 0x200;
+			m = 0;
+			OsdWrite(m++);
+			OsdWrite(m++, " Startup config:");
+			for (unsigned i = 0; i < 9; ++i)
+			{
+				char label[64];
+				bool enabled = falcon_config_describe(i, label, sizeof(label)) || save;
+				if (enabled) menumask |= 1 << i;
+				snprintf(s, 29, "  %s", label);
+				OsdWrite(m++, s, menusub == i, !enabled);
+				if (!i)
+				{
+					OsdWrite(m++);
+					OsdWrite(m++, " Other configs:");
+				}
+			}
+			for (; m < 15; ++m) OsdWrite(m);
+			OsdWrite(15, STD_BACK, menusub == 9);
+			// Move off an empty initial slot, even before the first key press.
+			if (!(menumask & (1 << menusub)))
+			{
+				while (!(menumask & (1 << menusub))) ++menusub;
+			}
+			else menustate = save ? MENU_FALCON_SAVE_CONFIG2 : MENU_FALCON_LOAD_CONFIG2;
+		}
+		break;
+
+	case MENU_FALCON_LOAD_CONFIG2:
+	case MENU_FALCON_SAVE_CONFIG2:
+		{
+			bool save = menustate == MENU_FALCON_SAVE_CONFIG2;
+			saved_menustate = parentstate;
+			if (menu || back || left || (select && menusub == 9))
+			{
+				menustate = MENU_FALCON_MAIN1;
+				menusub = save ? 4 : 3;
+			}
+			else if (select && menusub < 9 && (menumask & (1 << menusub)))
+			{
+				bool ok = save ? falcon_config_save(menusub) : falcon_config_load(menusub);
+				MenuHide();
+				Info(ok ? (save ? "Config saved" : "Config loaded") : falcon_config_error(), ok ? 1500 : 5000);
+			}
+		}
+		break;
 
 	case MENU_ST_MAIN1:
 		OsdSetSize(16);
@@ -8764,6 +8968,7 @@ int menu_allow_cfg_switch()
 	{
 		switch (menustate)
 		{
+		case MENU_FALCON_MAIN2:
 		case MENU_ST_MAIN2:
 		case MENU_ARCHIE_MAIN2:
 		case MENU_MINIMIG_MAIN2:
