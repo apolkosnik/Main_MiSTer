@@ -272,6 +272,7 @@ void diskled_on();
 #define DISKLED_OFF void()
 
 char is_minimig();
+char is_maximig();
 char is_next();
 char is_falcon();
 char is_menu();

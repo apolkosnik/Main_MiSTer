@@ -321,7 +321,9 @@ static char UploadActionReplay()
 		spi8((data >> 0) & 0xff);
 		data = (minimig_config.ide_cfg & 1) ? 0xff : 0; // ide, 1 byte
 		spi8((data >> 0) & 0xff);
-		data = 0xff; // a1200, 1 byte
+		// a1200, 1 byte: Gayle's IDE ($DA2000); the A4000 has its own
+		// ($DD2020), which HRTmon drives when this is 0
+		data = is_maximig() ? 0x00 : 0xff;
 		spi8((data >> 0) & 0xff);
 		data = minimig_config.chipset&CONFIG_AGA ? 0xff : 0; // aga, 1 byte
 		spi8((data >> 0) & 0xff);
@@ -594,9 +596,17 @@ int minimig_cfg_load(int num)
 		minimig_config.memory = 0x11;
 		minimig_config.cpu = 0;
 		minimig_config.chipset = 0;
+		if (is_maximig())
+		{
+			// an A4000/040: 2 MB chip RAM, 16 MB motherboard RAM, 68040 at
+			// 25 MHz with A4000 bus timing, AGA, the A4000 Kickstart
+			snprintf(minimig_config.kickstart, sizeof(minimig_config.kickstart) - 1, "%s/%s", HomeDir(), "KICK4000.ROM");
+			minimig_config.memory = 0x0F;
+			minimig_config.chipset = CONFIG_AGA | CONFIG_ECS;
+		}
 		minimig_config.floppy.speed = CONFIG_FLOPPY2X;
 		minimig_config.floppy.drives = 1;
-		minimig_config.ide_cfg = 0;
+		minimig_config.ide_cfg = is_maximig() ? 1 : 0;   // the A4000 has its IDE port on the board
 		minimig_config.hardfile[0].cfg = 1;
 		minimig_config.hardfile[0].filename[0] = 0;
 		minimig_config.hardfile[1].cfg = 1;

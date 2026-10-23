@@ -6867,24 +6867,49 @@ void HandleUI(void)
 		parentstate = menustate;
 
 		m = 0;
-		strcpy(s, " CPU      : ");
-		strcat(s, ((minimig_config.cpu & 0x23) == 0x23) ? "68EC020" : ((minimig_config.cpu & 0x23) == 0x22) ? "68EC030" : config_cpu_msg[minimig_config.cpu & 0x03]);
-		if ((minimig_config.cpu & 0x03) == 0x02) strcat(s, ((minimig_config.cpu & 0xc0) == 0x40) ? " 40MHz" : ((minimig_config.cpu & 0xc0) == 0x80) ? " 50MHz" : " Fast");
-		OsdWrite(m++, s, menusub == 0, 0);
+		if (is_maximig())
+		{
+			// the Amiga 4000/040: the 68040's clock and bus timing, the
+			// motherboard's RAM and the Zorro III RAM board (the rows keep
+			// Minimig's five indices: ROM and what follows line up)
+			static const char *mx_speed[] = { "25MHz (A3640)", "33MHz", "50MHz", "56MHz" };
+			static const char *mx_mbram[] = { "none", "4M", "8M", "16M" };
+			int z3 = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
 
-		OsdWrite(m++, "", 0, 0);
-		strcpy(s, " Chipset  : ");
-		strcat(s, config_chipset_msg[(minimig_config.chipset >> 2) & 7]);
-		OsdWrite(m++, s, menusub == 1, 0);
-		strcpy(s, " ChipRAM  : ");
-		strcat(s, config_memory_chip_msg[minimig_config.memory & 0x03]);
-		OsdWrite(m++, s, menusub == 2, 0);
-		strcpy(s, " FastRAM  : ");
-		strcat(s, config_memory_fast_msg[((minimig_config.cpu & 0x23) != 0x23 && (minimig_config.cpu & 2)) ? 1 : 0][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
-		OsdWrite(m++, s, menusub == 3, 0);
-		strcpy(s, " SlowRAM  : ");
-		strcat(s, config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]);
-		OsdWrite(m++, s, menusub == 4, 0);
+			sprintf(s, " CPU      : 68040 %s", mx_speed[minimig_config.cpu & 0x03]);
+			OsdWrite(m++, s, menusub == 0, 0);
+			sprintf(s, " Bus      : %s", (minimig_config.cpu & 0x20) ? "Fast" : "A4000");
+			OsdWrite(m++, s, menusub == 1, 0);
+
+			OsdWrite(m++, "", 0, 0);
+			OsdWrite(m++, " Chipset  : AGA", 0, 1);
+			OsdWrite(m++, " ChipRAM  : 2M", menusub == 2, 1);
+			sprintf(s, " Z3 RAM   : %s", !z3 ? "none" : (z3 < 4) ? "128M" : (z3 == 4) ? "256M" : "384M");
+			OsdWrite(m++, s, menusub == 3, 0);
+			sprintf(s, " MB RAM   : %s", mx_mbram[(minimig_config.memory >> 2) & 0x03]);
+			OsdWrite(m++, s, menusub == 4, 0);
+		}
+		else
+		{
+			strcpy(s, " CPU      : ");
+			strcat(s, ((minimig_config.cpu & 0x23) == 0x23) ? "68EC020" : ((minimig_config.cpu & 0x23) == 0x22) ? "68EC030" : config_cpu_msg[minimig_config.cpu & 0x03]);
+			if ((minimig_config.cpu & 0x03) == 0x02) strcat(s, ((minimig_config.cpu & 0xc0) == 0x40) ? " 40MHz" : ((minimig_config.cpu & 0xc0) == 0x80) ? " 50MHz" : " Fast");
+			OsdWrite(m++, s, menusub == 0, 0);
+
+			OsdWrite(m++, "", 0, 0);
+			strcpy(s, " Chipset  : ");
+			strcat(s, config_chipset_msg[(minimig_config.chipset >> 2) & 7]);
+			OsdWrite(m++, s, menusub == 1, 0);
+			strcpy(s, " ChipRAM  : ");
+			strcat(s, config_memory_chip_msg[minimig_config.memory & 0x03]);
+			OsdWrite(m++, s, menusub == 2, 0);
+			strcpy(s, " FastRAM  : ");
+			strcat(s, config_memory_fast_msg[((minimig_config.cpu & 0x23) != 0x23 && (minimig_config.cpu & 2)) ? 1 : 0][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
+			OsdWrite(m++, s, menusub == 3, 0);
+			strcpy(s, " SlowRAM  : ");
+			strcat(s, config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]);
+			OsdWrite(m++, s, menusub == 4, 0);
+		}
 
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " ROM      : ");
@@ -6932,7 +6957,34 @@ void HandleUI(void)
 	case MENU_MINIMIG_CHIPSET2:
 		saved_menustate = MENU_MINIMIG_CHIPSET1;
 
-		if (select || minus || plus)
+		if ((select || minus || plus) && is_maximig() && menusub <= 4)
+		{
+			if (menusub == 0)
+			{
+				minimig_config.cpu = (minimig_config.cpu & ~0x03) | ((minimig_config.cpu + (minus ? 3 : 1)) & 0x03);
+				minimig_ConfigCPU(minimig_config.cpu);
+			}
+			else if (menusub == 1)
+			{
+				minimig_config.cpu ^= 0x20;
+				minimig_ConfigCPU(minimig_config.cpu);
+			}
+			else if (menusub == 3)
+			{
+				// none, 128 MB, 256 MB, 384 MB
+				static const int z3_steps[4] = { 0, 1, 4, 5 };
+				int c = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
+				int k = (c == 0) ? 0 : (c < 4) ? 1 : (c == 4) ? 2 : 3;
+				c = z3_steps[(k + (minus ? 3 : 1)) & 3];
+				minimig_config.memory = ((c << 4) & 0x30) | ((c << 5) & 0x80) | (minimig_config.memory & ~0xB0);
+			}
+			else if (menusub == 4)
+			{
+				minimig_config.memory = ((minimig_config.memory + (minus ? -4 : 4)) & 0x0C) | (minimig_config.memory & ~0x0C);
+			}
+			menustate = MENU_MINIMIG_CHIPSET1;
+		}
+		else if (select || minus || plus)
 		{
 			if (menusub == 0)
 			{
@@ -7131,7 +7183,7 @@ void HandleUI(void)
 
 			MenuWrite(m++, "", 0, 0);
 
-			if (is_minimig() == 2)
+			if (is_minimig() == 2 && !is_maximig())
 			{
 				int cd32_on = minimig_config.cd32_drive.cfg ? 1 : 0;
 				int cdtv_on = minimig_config.cdtv_drive.cfg ? 1 : 0;

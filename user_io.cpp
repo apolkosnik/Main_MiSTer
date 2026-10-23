@@ -201,7 +201,7 @@ char *user_io_get_core_path(const char *suffix, int recheck)
 	static char tmp[1024] = {};
 	char *name = (ovr_name[0] && ovr_samedir) ? orig_name : core_name;
 
-	if (!suffix) suffix = (!strcasecmp(name, "minimig")) ? "Amiga" : name;
+	if (!suffix) suffix = (!strcasecmp(name, "minimig") || !strcasecmp(name, "maximig")) ? "Amiga" : name;
 	if (recheck || strcmp(old_name, suffix) || !tmp[0])
 	{
 		strcpy(old_name, suffix);
@@ -312,7 +312,7 @@ char is_minimig()
 {
 	if (!is_minimig_type)
 	{
-		is_minimig_type = (!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd")) ? 1 : 2;
+		is_minimig_type = (!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd") || !strcasecmp(orig_name, "maximig")) ? 1 : 2;
 		if (is_minimig_type == 1)
 		{
 			uint16_t res = spi_uio_cmd(UIO_GET_VMODE);
@@ -322,6 +322,12 @@ char is_minimig()
 	}
 
 	return (is_minimig_type == 1) ? 1 : (is_minimig_type == 3) ? 2 : 0;
+}
+
+// the Maximig core: an Amiga 4000/040 speaking the Minimig protocol
+char is_maximig()
+{
+	return !strcasecmp(orig_name, "maximig");
 }
 
 static int is_megacd_type = 0;
