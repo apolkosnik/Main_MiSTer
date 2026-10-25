@@ -12,6 +12,11 @@
 #define CONFIG_AGA       16
 #define CONFIG_CDTV      32
 
+// Maximig: the cartridge is the Action Replay (AR5.ROM, DeMoN v2 at
+// $A80000), not HRTmon, when it is enabled (memory bit 6): the core's
+// status bit 53
+#define MAXIMIG_EXTCFG_AR 0x200000
+
 #define CONFIG_FLOPPY1X  0
 #define CONFIG_FLOPPY2X  1
 
