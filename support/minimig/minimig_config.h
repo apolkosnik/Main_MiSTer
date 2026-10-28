@@ -17,6 +17,10 @@
 // status bit 53
 #define MAXIMIG_EXTCFG_AR 0x200000
 
+// Maximig: the CPU card is the BFG9060 (68040 firmware), not the A3640: the
+// core's status bit 54, taken at the next reset
+#define MAXIMIG_EXTCFG_BFG 0x400000
+
 #define CONFIG_FLOPPY1X  0
 #define CONFIG_FLOPPY2X  1
 

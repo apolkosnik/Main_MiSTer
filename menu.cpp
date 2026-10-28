@@ -6869,14 +6869,17 @@ void HandleUI(void)
 		m = 0;
 		if (is_maximig())
 		{
-			// the Amiga 4000/040: the 68040's clock and bus timing, the
-			// motherboard's RAM and the Zorro III RAM board (the rows keep
-			// Minimig's five indices: ROM and what follows line up)
-			static const char *mx_speed[] = { "25MHz (A3640)", "33MHz", "50MHz", "56MHz" };
+			// the Amiga 4000/040: the CPU card and the 68040's clock, the bus
+			// timing, the motherboard's RAM and the Zorro III RAM board (the
+			// rows keep Minimig's five indices: ROM and what follows line up)
+			static const char *mx_speed[] = { "25MHz", "33MHz", "50MHz", "56MHz" };
+			static const char *mx_bfg_speed[] = { "25MHz", "37.5MHz", "50MHz", "50MHz" };
 			static const char *mx_mbram[] = { "none", "4M", "8M", "16M" };
 			int z3 = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
+			int bfg = (minimig_get_extcfg() & MAXIMIG_EXTCFG_BFG) ? 1 : 0;
 
-			sprintf(s, " CPU      : 68040 %s", mx_speed[minimig_config.cpu & 0x03]);
+			if (bfg) sprintf(s, " CPU      : BFG9060 %s", mx_bfg_speed[minimig_config.cpu & 0x03]);
+			else sprintf(s, " CPU      : A3640 %s", mx_speed[minimig_config.cpu & 0x03]);
 			OsdWrite(m++, s, menusub == 0, 0);
 			sprintf(s, " Bus      : %s", (minimig_config.cpu & 0x20) ? "Fast" : "A4000");
 			OsdWrite(m++, s, menusub == 1, 0);
@@ -6884,7 +6887,9 @@ void HandleUI(void)
 			OsdWrite(m++, "", 0, 0);
 			OsdWrite(m++, " Chipset  : AGA", 0, 1);
 			OsdWrite(m++, " ChipRAM  : 2M", menusub == 2, 1);
-			sprintf(s, " Z3 RAM   : %s", !z3 ? "none" : (z3 < 4) ? "128M" : (z3 == 4) ? "256M" : "384M");
+			// (with the BFG9060 its 128 MB takes the 128 MB board's memory)
+			if (bfg) sprintf(s, " Z3 RAM   : %s", (z3 >= 4) ? "256M" : "none");
+			else sprintf(s, " Z3 RAM   : %s", !z3 ? "none" : (z3 < 4) ? "128M" : (z3 == 4) ? "256M" : "384M");
 			OsdWrite(m++, s, menusub == 3, 0);
 			sprintf(s, " MB RAM   : %s", mx_mbram[(minimig_config.memory >> 2) & 0x03]);
 			OsdWrite(m++, s, menusub == 4, 0);
@@ -6971,7 +6976,17 @@ void HandleUI(void)
 		{
 			if (menusub == 0)
 			{
-				minimig_config.cpu = (minimig_config.cpu & ~0x03) | ((minimig_config.cpu + (minus ? 3 : 1)) & 0x03);
+				// the card and its clock: the A3640 at 25, 33, 50, 56 MHz, the
+				// BFG9060 at 25, 37.5, 50 MHz; a change of card takes effect at
+				// the next reset (the core takes it in reset)
+				static const int steps = 7;
+				int bfg = (minimig_get_extcfg() & MAXIMIG_EXTCFG_BFG) ? 1 : 0;
+				int k = bfg ? 4 + ((minimig_config.cpu & 3) > 2 ? 2 : (minimig_config.cpu & 3)) : (minimig_config.cpu & 3);
+				k = (k + (minus ? steps - 1 : 1)) % steps;
+				bfg = (k >= 4);
+				minimig_config.cpu = (minimig_config.cpu & ~0x03) | (bfg ? k - 4 : k);
+				if (bfg) minimig_config.ext_cfg2 |= MAXIMIG_EXTCFG_BFG >> 16;
+				else minimig_config.ext_cfg2 &= ~(MAXIMIG_EXTCFG_BFG >> 16);
 				minimig_ConfigCPU(minimig_config.cpu);
 			}
 			else if (menusub == 1)
@@ -6981,11 +6996,12 @@ void HandleUI(void)
 			}
 			else if (menusub == 3)
 			{
-				// none, 128 MB, 256 MB, 384 MB
+				// none, 128 MB, 256 MB, 384 MB (with the BFG9060: none, 256 MB)
 				static const int z3_steps[4] = { 0, 1, 4, 5 };
 				int c = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
 				int k = (c == 0) ? 0 : (c < 4) ? 1 : (c == 4) ? 2 : 3;
-				c = z3_steps[(k + (minus ? 3 : 1)) & 3];
+				if (minimig_get_extcfg() & MAXIMIG_EXTCFG_BFG) c = (c >= 4) ? 0 : 4;
+				else c = z3_steps[(k + (minus ? 3 : 1)) & 3];
 				minimig_config.memory = ((c << 4) & 0x30) | ((c << 5) & 0x80) | (minimig_config.memory & ~0xB0);
 			}
 			else if (menusub == 4)
