@@ -291,10 +291,15 @@ static char UploadKickstart(char *name)
 	return(0);
 }
 
+unsigned int minimig_cart_ar_bit()
+{
+	return is_maximig() ? MAXIMIG_EXTCFG_AR : MINIMIG_EXTCFG_AR;
+}
+
 static char UploadActionReplay()
 {
 	fileTYPE file = {};
-	if (is_maximig() && (minimig_get_extcfg() & MAXIMIG_EXTCFG_AR))
+	if (minimig_get_extcfg() & minimig_cart_ar_bit())
 	{
 		// the Action Replay: AR5's DeMoN v2 build, its ROM ($A80000) and RAM
 		// ($AC0000) image, 512 KB at most; it takes no configuration
@@ -492,9 +497,8 @@ static void ApplyConfiguration(char reloadkickstart)
 	minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
 	minimig_ConfigFloppyExt(minimig_config.externalfloppy.exDrives[0], minimig_config.externalfloppy.exDrives[1], minimig_config.externalfloppy.exDrives[2], minimig_config.externalfloppy.exDrives[3]);
 
-	// Maximig: the cartridge's type before its image goes up, while the CPU
-	// is halted
-	if (is_maximig()) minimig_set_extcfg(minimig_get_extcfg() & ~1);
+	// the cartridge's type before its image goes up, while the CPU is halted
+	minimig_set_extcfg(minimig_get_extcfg() & ~1);
 	if (minimig_config.memory & 0x40) UploadActionReplay();
 
 	if (reloadkickstart)

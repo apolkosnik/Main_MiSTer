@@ -21,6 +21,10 @@
 // core's status bit 54, taken at the next reset
 #define MAXIMIG_EXTCFG_BFG 0x400000
 
+// Minimig: the same choice of cartridge, the core's status bit 55 (bits 21
+// and 22 are the CD speed there)
+#define MINIMIG_EXTCFG_AR 0x800000
+
 #define CONFIG_FLOPPY1X  0
 #define CONFIG_FLOPPY2X  1
 
@@ -102,6 +106,10 @@ int minimig_cfg_save(int num);
 const char* minimig_get_cfg_info(int num, int label);
 
 void minimig_reset();
+
+// the cartridge (memory bit 6) is the Action Replay, not HRTmon: the ext_cfg
+// bit the core (Minimig or Maximig) takes it from
+unsigned int minimig_cart_ar_bit();
 void minimig_set_kickstart(const char *name);
 void minimig_set_extrom(const char *name);
 const char* minimig_get_extrom();
