@@ -12,18 +12,15 @@
 #define CONFIG_AGA       16
 #define CONFIG_CDTV      32
 
-// Maximig: the cartridge is the Action Replay (AR5.ROM, DeMoN v2 at
-// $A80000), not HRTmon, when it is enabled (memory bit 6): the core's
-// status bit 53
-#define MAXIMIG_EXTCFG_AR 0x200000
+// the cartridge is the Action Replay (AR5.ROM, DeMoN v2 at $A80000), not
+// HRTmon, when it is enabled (memory bit 6): the core's status bit 55, for
+// Minimig and Maximig alike (bits 19-22 are Minimig's drive sounds and CD
+// speed)
+#define MINIMIG_EXTCFG_AR 0x800000
 
 // Maximig: the CPU card is the BFG9060 (68040 firmware), not the A3640: the
-// core's status bit 54, taken at the next reset
-#define MAXIMIG_EXTCFG_BFG 0x400000
-
-// Minimig: the same choice of cartridge, the core's status bit 55 (bits 21
-// and 22 are the CD speed there)
-#define MINIMIG_EXTCFG_AR 0x800000
+// core's status bit 56, taken at the next reset
+#define MAXIMIG_EXTCFG_BFG 0x1000000
 
 #define CONFIG_FLOPPY1X  0
 #define CONFIG_FLOPPY2X  1
@@ -107,9 +104,6 @@ const char* minimig_get_cfg_info(int num, int label);
 
 void minimig_reset();
 
-// the cartridge (memory bit 6) is the Action Replay, not HRTmon: the ext_cfg
-// bit the core (Minimig or Maximig) takes it from
-unsigned int minimig_cart_ar_bit();
 void minimig_set_kickstart(const char *name);
 void minimig_set_extrom(const char *name);
 const char* minimig_get_extrom();

@@ -6768,7 +6768,7 @@ void HandleUI(void)
 				fastcfg ? config_memory_fast_msg[((minimig_config.cpu & 0x23) != 0x23 && (minimig_config.cpu & 2)) ? 1 : 0][fastcfg] : "",
 				((minimig_config.memory >> 2) & 0x03) ? "+" : "",
 				((minimig_config.memory >> 2) & 0x03) ? config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03] : "",
-				(minimig_config.memory & 0x40) ? ((minimig_get_extcfg() & minimig_cart_ar_bit()) ? " AR" : " HRT") : ""
+				(minimig_config.memory & 0x40) ? ((minimig_get_extcfg() & MINIMIG_EXTCFG_AR) ? " AR" : " HRT") : ""
 			);
 
 			char *p = strrchr(minimig_config.kickstart, '/');
@@ -6942,7 +6942,7 @@ void HandleUI(void)
 		// the cartridge: HRTmon or the Action Replay (AR5, DeMoN v2)
 		strcpy(s, " Cartridge: ");
 		strcat(s, !(minimig_config.memory & 0x40) ? "Off" :
-			(minimig_get_extcfg() & minimig_cart_ar_bit()) ? "Action Replay" : "HRTmon");
+			(minimig_get_extcfg() & MINIMIG_EXTCFG_AR) ? "Action Replay" : "HRTmon");
 		OsdWrite(m++, s, menusub == 7, 0);
 
 		OsdWrite(m++, "", 0, 0);
@@ -7134,12 +7134,11 @@ void HandleUI(void)
 			{
 				// Off -> HRTmon -> Action Replay -> Off; kept in the config and
 				// sent to the core at the next reset, with the cartridge's image
-				unsigned int arbit = minimig_cart_ar_bit();
-				int c = !(minimig_config.memory & 0x40) ? 0 : (minimig_get_extcfg() & arbit) ? 2 : 1;
+				int c = !(minimig_config.memory & 0x40) ? 0 : (minimig_get_extcfg() & MINIMIG_EXTCFG_AR) ? 2 : 1;
 				c = (c + (minus ? 2 : 1)) % 3;
 				minimig_config.memory = (minimig_config.memory & ~0x40) | (c ? 0x40 : 0);
-				if (c == 2) minimig_config.ext_cfg2 |= arbit >> 16;
-				else minimig_config.ext_cfg2 &= ~(arbit >> 16);
+				if (c == 2) minimig_config.ext_cfg2 |= MINIMIG_EXTCFG_AR >> 16;
+				else minimig_config.ext_cfg2 &= ~(MINIMIG_EXTCFG_AR >> 16);
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
 			else if (menusub == 9)

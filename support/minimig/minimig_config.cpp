@@ -291,15 +291,10 @@ static char UploadKickstart(char *name)
 	return(0);
 }
 
-unsigned int minimig_cart_ar_bit()
-{
-	return is_maximig() ? MAXIMIG_EXTCFG_AR : MINIMIG_EXTCFG_AR;
-}
-
 static char UploadActionReplay()
 {
 	fileTYPE file = {};
-	if (minimig_get_extcfg() & minimig_cart_ar_bit())
+	if (minimig_get_extcfg() & MINIMIG_EXTCFG_AR)
 	{
 		// the Action Replay: AR5's DeMoN v2 build, its ROM ($A80000) and RAM
 		// ($AC0000) image, 512 KB at most; it takes no configuration
