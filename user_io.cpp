@@ -42,6 +42,7 @@
 #include "frame_timer.h"
 #include "scaler.h"
 #include "support.h"
+#include "mnu.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -199,7 +200,7 @@ char *user_io_get_core_path(const char *suffix, int recheck)
 	static char tmp[1024] = {};
 	char *name = (ovr_name[0] && ovr_samedir) ? orig_name : core_name;
 
-	if (!suffix) suffix = (!strcasecmp(name, "minimig")) ? "Amiga" : name;
+	if (!suffix) suffix = (!strcasecmp(name, "minimig") || mnu_family() == MNU_FAMILY_MINIMIG) ? "Amiga" : name;
 	if (recheck || strcmp(old_name, suffix) || !tmp[0])
 	{
 		strcpy(old_name, suffix);
@@ -310,7 +311,8 @@ char is_minimig()
 {
 	if (!is_minimig_type)
 	{
-		is_minimig_type = (!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd")) ? 1 : 2;
+		is_minimig_type = (!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd") ||
+		                   mnu_family() == MNU_FAMILY_MINIMIG) ? 1 : 2;
 		if (is_minimig_type == 1)
 		{
 			uint16_t res = spi_uio_cmd(UIO_GET_VMODE);
@@ -1566,6 +1568,14 @@ void user_io_init(const char *path, const char *xml)
 		app_restart(path, xml, main);
 	}
 
+	// A menu module may run the core as a family it does not name itself
+	// (mnu_api.h): decided before anything below asks what the core is.
+	if (mnu_probe(path, xml) != MNU_FAMILY_NONE)
+	{
+		is_minimig_type = 0;
+		user_io_get_core_path(NULL, 1);
+	}
+
 	uint8_t hotswap[4] = {};
 	ide_reset(hotswap);
 
@@ -1849,6 +1859,9 @@ void user_io_init(const char *path, const char *xml)
 	{
 		mgl_get()->timer = GetTimer(mgl_get()->item[0].delay * 1000);
 	}
+
+	// Per-core menu module, if one sits next to the rbf.
+	mnu_try_load(path, xml);
 }
 
 static int joyswap = 0;
@@ -3341,6 +3354,7 @@ void user_io_poll()
 
 	user_io_send_buttons(0);
 
+	mnu_poll();
 	mac_poll();   // Mac SCSI family: Toolbox slot announce + deferred CD work
 	sun_poll();   // Sun SCSI family: write-buffer flushes
 	hp9k_poll();

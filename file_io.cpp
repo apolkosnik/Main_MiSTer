@@ -28,6 +28,7 @@
 #include "user_io.h"
 #include "cfg.h"
 #include "input.h"
+#include "mnu.h"
 #include "support.h"
 #include "miniz.h"
 #include "scheduler.h"
@@ -1833,6 +1834,9 @@ int ScanDirectory(char* path, int mode, const char *extension, int options, cons
 				    if (isZip)
 				        dext.flags |= DT_EXT_ZIP;
 				    get_display_name(&dext, extension, options);
+				    // datecode is only filled in for .rbf entries; full_path still names this file
+				    if (!isZip && (options & SCANO_CORES) && dext.datecode[0] && mnu_available(full_path))
+				        dext.flags |= DT_EXT_MNU;
 				    DirItem.push_back(dext);
         }
 			}

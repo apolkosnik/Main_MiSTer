@@ -31,6 +31,7 @@ struct direntext_t
 	dirent de;
 	int  cookie;
 #define DT_EXT_ZIP    0x1
+#define DT_EXT_MNU    0x2   // a menu module (.mnu) will load with this core
 	unsigned int flags;
 	char datecode[16];
 	char altname[256];

@@ -68,6 +68,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "profiling.h"
 #include "str_util.h"
 #include "autofire.h"
+#include "mnu.h"
 
 /*menu states*/
 enum MENU
@@ -236,7 +237,14 @@ enum MENU
 	// Atari 8bit cartridge type selection
 	MENU_ATARI8BIT_CART1,
 	MENU_ATARI8BIT_CART2,
+
+	// Menu module (.mnu) owns the OSD, see mnu.cpp
+	MENU_MODULE1,
+	MENU_MODULE2,
+	MENU_MODULE_FILE_SELECTED,
 };
+// SelectFile() carries menu states in an unsigned char.
+static_assert(MENU_MODULE_FILE_SELECTED < 256, "MENU enum no longer fits in a byte");
 
 static uint32_t menustate = MENU_NONE1;
 static uint32_t parentstate;
@@ -617,7 +625,7 @@ static uint32_t menu_key_get(void)
 		else if (CheckTimer(repeat))
 		{
 			repeat = GetTimer(REPEATRATE);
-			if (GetASCIIKey(c1) || menustate == MENU_FILE_SELECT2 || ((menustate == MENU_COMMON2) && (menusub == 17)) || ((menustate == MENU_SYSTEM2) && (menusub == 5)))
+			if (GetASCIIKey(c1) || menustate == MENU_FILE_SELECT2 || ((menustate == MENU_COMMON2) && (menusub == 17)) || ((menustate == MENU_SYSTEM2) && (menusub == 5)) || ((menustate == MENU_MODULE2) && (mnu_flags() & MNU_FLAG_KEY_REPEAT)))
 			{
 				c = c1;
 				hold_cnt++;
@@ -1117,6 +1125,101 @@ static void *close_pipe_async(void *arg)
 	return NULL;
 }
 
+// The main menu of the running core: the module if one is loaded, otherwise
+// the dedicated or generic stock menu.
+static uint32_t stock_main_menu()
+{
+	if (is_minimig()) return MENU_MINIMIG_MAIN1;
+	if (is_archie()) return MENU_ARCHIE_MAIN1;
+	if (is_st()) return MENU_ST_MAIN1;
+	return MENU_GENERIC_MAIN1;
+}
+
+static uint32_t core_main_menu()
+{
+	return mnu_active() ? (uint32_t)MENU_MODULE1 : stock_main_menu();
+}
+
+// Apply what a module's ui()/file_selected() asked for.
+static void mnu_apply(int act)
+{
+	switch (act)
+	{
+	case MNU_ACT_STAY:
+		break;
+
+	case MNU_ACT_REDRAW:
+		menustate = MENU_MODULE1;
+		break;
+
+	case MNU_ACT_CLOSE:
+		menustate = MENU_NONE1;
+		break;
+
+	case MNU_ACT_STOCK_MENU:
+		menusub = 0;
+		page = 0;
+		parentstate = MENU_NONE1;
+		menustate = stock_main_menu();
+		break;
+
+	case MNU_ACT_SYSTEM_MENU:
+		menusub = 0;
+		menustate = MENU_COMMON1;
+		break;
+
+	case MNU_ACT_UNLOAD:
+		mnu_unload(MNU_UNLOAD_REQUEST);
+		break;
+
+	case MNU_ACT_MISC_MENU:
+		menusub = 3;
+		menustate = MENU_MISC1;
+		break;
+
+	default:
+		printf("MNU: %s returned unknown action %d\n", mnu_file(), act);
+		mnu_unload(MNU_UNLOAD_ERROR);
+		break;
+	}
+}
+
+// F9 in a core's main menu switches between the module and the stock menu,
+// in place: from the module menu it unloads the module and shows the stock
+// menu, from the stock menu it loads the module again and shows its menu.
+// Returns 1 when the key was used.
+static int mnu_toggle_key()
+{
+	switch (menustate)
+	{
+	case MENU_MODULE2:
+		mnu_unload(MNU_UNLOAD_USER);   // restores MENU_NONE1 and asks for a reopen...
+		mnu_take_reopen();             // ...but the OSD stays up and switches right here
+		OsdClear();
+		OsdSetSize(16);
+		menusub = 0;
+		page = 0;
+		firstmenu = 0;
+		parentstate = MENU_NONE1;
+		menustate = stock_main_menu();
+		return 1;
+
+	case MENU_GENERIC_MAIN3:
+	case MENU_MINIMIG_MAIN2:
+	case MENU_ST_MAIN2:
+	case MENU_ARCHIE_MAIN2:
+		if (!mnu_load_again()) return 0;
+		OsdClear();
+		menusub = 0;
+		firstmenu = 0;
+		menustate = MENU_MODULE1;
+		return 1;
+
+	default:
+		return 0;
+	}
+}
+
 void HandleUI(void)
 {
 	PROFILE_FUNCTION();
@@ -1422,6 +1525,7 @@ void HandleUI(void)
 					has_fb_terminal = 1;
 				}
 			}
+			else mnu_toggle_key();   // menu module <-> stock menu
 			break;
 
 		case KEY_F7: // added: F7 activates joystick map if OSD is visible, or in menu core
@@ -1618,6 +1722,8 @@ void HandleUI(void)
 		break;
 	}
 
+	mnu_service();
+
 	// Switch to current menu screen
 	switch (menustate)
 	{
@@ -1631,6 +1737,7 @@ void HandleUI(void)
 		firstmenu = 0;
 		vga_nag();
 		OsdSetSize(8);
+		mnu_osd_closed();
 		break;
 
 	case MENU_INFO:
@@ -1638,6 +1745,7 @@ void HandleUI(void)
 		// fall through
 
 	case MENU_NONE2:
+		if (mnu_take_reopen()) menu = true;
 		if (menu && !osd_unlocked)
 		{
 			menustate = MENU_UNLOCK1;
@@ -1654,6 +1762,11 @@ void HandleUI(void)
 			else if (saved_menustate)
 			{
 				menustate = saved_menustate;
+			}
+			else if (mnu_active() && mgl->done && !select_ini)
+			{
+				if ((get_key_mod() & (LGUI | RGUI)) && !is_f12_mod_needed()) menustate = MENU_COMMON1; //Win+Menu
+				else menustate = MENU_MODULE1;
 			}
 			else if (is_st()) menustate = MENU_ST_MAIN1;
 			else if (is_archie()) menustate = MENU_ARCHIE_MAIN1;
@@ -1741,6 +1854,72 @@ void HandleUI(void)
 		else if (right && FileExists(cfg_get_name(3)))
 		{
 			user_io_set_ini(3);
+		}
+		break;
+
+		/******************************************************************/
+		/* menu module (.mnu) owns the OSD, see mnu.cpp                   */
+		/******************************************************************/
+	case MENU_MODULE1:
+	case MENU_MODULE2:
+		{
+			mnu_event_t ev;
+			memset(&ev, 0, sizeof(ev));
+			ev.size = sizeof(ev);
+
+			if (menustate == MENU_MODULE1)
+			{
+				// (re)entry: the key that brought us here is not for the module
+				helptext_idx = 0;
+				menumask = 0;
+				parentstate = MENU_MODULE1;
+				menustate = MENU_MODULE2;
+				mnu_osd_opened();
+				ev.redraw = 1;
+			}
+			else
+			{
+				if (menu && !(mnu_flags() & MNU_FLAG_HANDLE_MENU_KEY))
+				{
+					menustate = MENU_NONE1;
+					break;
+				}
+				ev.key = c;
+				ev.key_mod = get_key_mod();
+				ev.hold = (uint16_t)hold_cnt;
+				ev.up = up;
+				ev.down = down;
+				ev.left = left;
+				ev.right = right;
+				ev.select = select;
+				ev.back = back;
+				ev.menu = menu;
+				ev.plus = plus;
+				ev.minus = minus;
+				ev.recent = recent;
+			}
+
+			uint32_t before = menustate;
+			int act = mnu_ui(&ev);
+			if (!mnu_active()) break;          // unloaded during ui(); mnu_unload() restored the state
+			if (menustate != before) break;    // the module opened the file selector
+			mnu_apply(act);
+		}
+		break;
+
+	case MENU_MODULE_FILE_SELECTED:
+		{
+			int keep = (mnu_flags() & MNU_FLAG_SELECT_KEEPS_OSD) != 0;
+			if (keep) menustate = MENU_MODULE1;
+			else MenuHide();   // like the stock loaders: progress messages need the menu out of the way
+
+			uint32_t before = menustate;
+			int act = mnu_file_selected(selPath);
+			if (!mnu_active() || menustate != before) break;
+
+			if (keep) mnu_apply(act);
+			else if (act == MNU_ACT_UNLOAD) mnu_unload(MNU_UNLOAD_REQUEST);
+			else if (act != MNU_ACT_CLOSE) mnu_set_reopen();   // STAY/REDRAW/menus: bring the module menu back
 		}
 		break;
 
@@ -3177,13 +3356,13 @@ void HandleUI(void)
 
 			case 14:
 				// Save settings
-				menustate = MENU_GENERIC_MAIN1;
+				menustate = core_main_menu();
 				menusub = 0;
 
 				if (is_archie())
 				{
 					archie_save_config();
-					menustate = MENU_ARCHIE_MAIN1;
+					menustate = core_main_menu();
 				}
 				else
 				{
@@ -3234,25 +3413,9 @@ void HandleUI(void)
 			switch (user_io_core_type())
 			{
 			case CORE_TYPE_8BIT:
-				if (is_minimig())
 				{
 					menusub = 0;
-					menustate = MENU_MINIMIG_MAIN1;
-				}
-				else if (is_archie())
-				{
-					menusub = 0;
-					menustate = MENU_ARCHIE_MAIN1;
-				}
-				else if (is_st())
-				{
-					menusub = 0;
-					menustate = MENU_ST_MAIN1;
-				}
-				else
-				{
-					menusub = 0;
-					menustate = MENU_GENERIC_MAIN1;
+					menustate = core_main_menu();
 				}
 				break;
 			}
@@ -4231,25 +4394,9 @@ void HandleUI(void)
 					menusub = 4;
 					menustate = MENU_SYSTEM1;
 				}
-				else if (is_minimig())
-				{
+				else {
 					menusub = 0;
-					menustate = MENU_MINIMIG_MAIN1;
-				}
-				else if (is_archie())
-				{
-					menusub = 0;
-					menustate = MENU_ARCHIE_MAIN1;
-				}
-				else if (is_st())
-				{
-					menusub = 0;
-					menustate = MENU_ST_MAIN1;
-				}
-				else
-				{
-					menusub = 0;
-					menustate = MENU_GENERIC_MAIN1;
+					menustate = core_main_menu();
 				}
 				break;
 			}
@@ -8638,6 +8785,13 @@ void PrintDirectory(int expand)
 				len2 = 0;
 			}
 
+			if (flist_DirItem(k)->flags & DT_EXT_MNU)
+			{
+				// a menu module loads with this core: mark the column after the date
+				if (cfg.rbf_hide_datecode && strlen(flist_DirItem(k)->altname) >= 28) s[27] = 22;
+				s[28] = '*';
+			}
+
 			if (!i && k) leftchar = 17;
 			if (i && k < flist_nDirEntries() - 1) leftchar = 16;
 		}
@@ -8729,6 +8883,82 @@ void MenuHide()
 int menu_present()
 {
 	return (menustate != MENU_NONE1) && (menustate != MENU_NONE2);
+}
+
+/////////////////////////////////////////////////////////////////////////
+// menu module (.mnu) glue, see mnu.cpp
+
+void menu_mod_draw_begin()
+{
+	adjvisible = 0;
+}
+
+void menu_mod_write(int row, const char *s, unsigned char invert, unsigned char stipple, int arrow)
+{
+	MenuWrite((unsigned char)row, s, invert, stipple, arrow);
+}
+
+int menu_mod_draw_end()
+{
+	if (!adjvisible) return 0;
+	firstmenu += adjvisible;
+	return 1;
+}
+
+void menu_mod_reset_scroll()
+{
+	firstmenu = 0;
+}
+
+// the aspect ratio choices the stock menus offer (MiSTer.ini's custom ones)
+int menu_mod_ar_name(int ar, char *buf, int len)
+{
+	char s[64] = {};
+	ar = get_ar_name(ar & 3, s);
+	if (buf && len > 0) snprintf(buf, len, "%s", s);
+	return ar;
+}
+
+int menu_mod_ar_next(int ar, int minus)
+{
+	return next_ar(ar & 3, minus);
+}
+
+void menu_mod_select_file(const char *path, const char *ext, uint32_t options)
+{
+	// SelectFile() keeps extensions in a 12 character buffer, 3 per extension.
+	static char fext[13];
+	snprintf(fext, sizeof(fext), "%s", ext);
+	if (strlen(ext) > 12) printf("MNU: extension list \"%s\" cut to \"%s\"\n", ext, fext);
+	while (strlen(fext) % 3) strcat(fext, " ");
+
+	options &= SCANO_DIR | SCANO_UMOUNT | SCANO_TXT | SCANO_NOENTER | SCANO_NOZIP | SCANO_CLEAR | SCANO_SAVES;
+	SelectFile(path, fext, options, MENU_MODULE_FILE_SELECTED, MENU_MODULE1);
+}
+
+int menu_mod_owns_osd()
+{
+	switch (menustate)
+	{
+	case MENU_MODULE1:
+	case MENU_MODULE2:
+	case MENU_MODULE_FILE_SELECTED:
+		return 1;
+
+	case MENU_FILE_SELECT1:
+	case MENU_FILE_SELECT2:
+		return fs_MenuSelect == MENU_MODULE_FILE_SELECTED;
+
+	default:
+		return 0;
+	}
+}
+
+void menu_mod_restore()
+{
+	page = 0;
+	firstmenu = 0;
+	menustate = MENU_NONE1;
 }
 
 void Info(const char *message, int timeout, int width, int height, int frame)

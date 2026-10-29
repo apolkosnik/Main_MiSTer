@@ -29,3 +29,6 @@ host
 .vs
 MiSTer
 /bin
+tests/mnu/build/
+mnu_template/build/
+mnu_template/*.mnu

@@ -36,6 +36,7 @@
 #include "frame_timer.h"
 #include "scaler.h"
 #include "file_io.h"
+#include "mnu.h"
 
 #define NUMDEV 30
 #define UINPUT_NAME "MiSTer virtual input"
@@ -6581,6 +6582,7 @@ int input_test(int getchar)
 						if(isXmlName(cmd)) xml_load(cmd + 10);
 						else fpga_load_rbf(cmd + 10);
 					}
+					else if (!strncmp(cmd, "mnu_", 4)) mnu_cmd(cmd);
 					else if (!strncmp(cmd, "screenshot", 10))
 					{
 						char *p = cmd + 10;

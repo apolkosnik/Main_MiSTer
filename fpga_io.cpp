@@ -22,6 +22,7 @@
 #include "fpga_system_manager.h"
 #include "fpga_reset_manager.h"
 #include "fpga_nic301.h"
+#include "mnu.h"
 
 #define FPGA_REG_BASE 0xFF000000
 #define FPGA_REG_SIZE 0x01000000
@@ -425,6 +426,7 @@ static int make_env(const char *name, const char *cfg)
 
 int fpga_load_rbf(const char *name, const char *cfg, const char *xml)
 {
+	mnu_unload(MNU_UNLOAD_CORE_EXIT);
 	OsdDisable();
 	static char path[1024];
 	int ret = 0;
@@ -619,6 +621,7 @@ char *getappname()
 
 void app_restart(const char *path, const char *xml, const char *exe)
 {
+	mnu_unload(MNU_UNLOAD_CORE_EXIT);
 	sync();
 	fpga_core_reset(1);
 

@@ -23,6 +23,7 @@
 #include "hardware.h"
 #include "ide.h"
 #include "ide_cdrom.h"
+#include "mnu.h"
 
 #if 0
 	#define dbg_printf     printf
@@ -790,6 +791,45 @@ inline int readhdd(drive_t *drive, uint32_t lba, int cnt)
 	}
 }
 
+// cnt sectors (at most 32) of a hard disk, as the IDE reads and writes them:
+// the sectors below the image's offset are the made-up RDB (written: dropped)
+int ide_hdd_read(drive_t *drive, uint32_t lba, uint8_t *buf, uint32_t cnt)
+{
+	while (cnt)
+	{
+		uint32_t n = cnt;
+		if (lba < drive->offset)
+		{
+			if (n > drive->offset - lba) n = drive->offset - lba;
+			if (!drive->type) fill_fake_rdb(drive, lba, n);
+			else memset(ide_buf, 0, n * 512);
+			memcpy(buf, ide_buf, n * 512);
+		}
+		else if (!FileSeekLBA(drive->f, lba - drive->offset) || FileReadAdv(drive->f, buf, n * 512, -1) <= 0) return 0;
+		buf += n * 512;
+		lba += n;
+		cnt -= n;
+	}
+	return 1;
+}
+
+int ide_hdd_write(drive_t *drive, uint32_t lba, const uint8_t *buf, uint32_t cnt)
+{
+	while (cnt)
+	{
+		uint32_t n = cnt;
+		if (lba < drive->offset)
+		{
+			if (n > drive->offset - lba) n = drive->offset - lba;
+		}
+		else if (!FileSeekLBA(drive->f, lba - drive->offset) || FileWriteAdv(drive->f, (void*)buf, n * 512, -1) <= 0) return 0;
+		buf += n * 512;
+		lba += n;
+		cnt -= n;
+	}
+	return 1;
+}
+
 static void process_read(ide_config *ide, int multi)
 {
 	uint32_t lba = get_lba(ide);
@@ -1004,6 +1044,14 @@ static int handle_hdd(ide_config *ide)
 void ide_io(int num, int req)
 {
 	ide_config *ide = &ide_inst[num];
+
+	// requests 1-3 the IDE controller never makes: a menu module's (e.g. a
+	// SCSI target the core runs on this channel)
+	if (req >= 1 && req <= 3)
+	{
+		mnu_ide_request(num, req);
+		return;
+	}
 
 	//printf("req: %d, disk: %d\n", req, num);
 

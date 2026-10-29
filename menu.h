@@ -27,4 +27,15 @@ const char *GetIdx_S(int idx);
 
 int menu_present();
 
+// glue for the menu module host (mnu.cpp)
+void menu_mod_draw_begin();
+void menu_mod_write(int row, const char *s, unsigned char invert, unsigned char stipple, int arrow);
+int  menu_mod_draw_end();
+void menu_mod_reset_scroll();
+int  menu_mod_ar_name(int ar, char *buf, int len);
+int  menu_mod_ar_next(int ar, int minus);
+void menu_mod_select_file(const char *path, const char *ext, uint32_t options);
+int  menu_mod_owns_osd();
+void menu_mod_restore();
+
 #endif

@@ -291,6 +291,15 @@ static char UploadKickstart(char *name)
 	return(0);
 }
 
+// HRTmon's "A1200" byte: Gayle's IDE at $DA2000; a menu module for another
+// machine may say otherwise (mnu_minimig.h)
+static uint8_t hrtmon_a1200 = 0xff;
+
+void minimig_set_hrtmon_a1200(uint8_t value)
+{
+	hrtmon_a1200 = value;
+}
+
 static char UploadActionReplay()
 {
 	fileTYPE file = {};
@@ -341,7 +350,7 @@ static char UploadActionReplay()
 		spi8((data >> 0) & 0xff);
 		data = (minimig_config.ide_cfg & 1) ? 0xff : 0; // ide, 1 byte
 		spi8((data >> 0) & 0xff);
-		data = 0xff; // a1200, 1 byte
+		data = hrtmon_a1200; // a1200, 1 byte
 		spi8((data >> 0) & 0xff);
 		data = minimig_config.chipset&CONFIG_AGA ? 0xff : 0; // aga, 1 byte
 		spi8((data >> 0) & 0xff);

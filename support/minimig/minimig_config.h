@@ -97,6 +97,7 @@ int minimig_cfg_save(int num);
 const char* minimig_get_cfg_info(int num, int label);
 
 void minimig_reset();
+void minimig_set_hrtmon_a1200(uint8_t value);
 void minimig_set_kickstart(const char *name);
 void minimig_set_extrom(const char *name);
 const char* minimig_get_extrom();

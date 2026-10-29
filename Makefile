@@ -104,3 +104,12 @@ $(BUILDDIR)/%.cpp.d: %.cpp
 
 # Ensure correct time stamp
 $(BUILDDIR)/main.cpp.o: $(filter-out $(BUILDDIR)/main.cpp.o, $(OBJ))
+
+# ---------------------------------------------------------------------------
+# Menu modules (.mnu) live with their cores, in <core>/menu/, and are built
+# there by including mnu_module.mk. This target only builds the template in
+# mnu_template/ so the SDK keeps compiling.
+.PHONY: modules mnu_template
+modules: mnu_template
+mnu_template:
+	$(Q)$(MAKE) --no-print-directory -C mnu_template MAIN_MISTER=$(CURDIR) BASE=$(BASE)
